@@ -601,7 +601,7 @@ func (r *resolver) matchInModule(ctx context.Context, pattern string, m module.V
 		err      error
 	}
 
-	e := r.matchInModuleCache.Do(key{pattern, m}, func() interface{} {
+	e := r.matchInModuleCache.Do(key{pattern, m}, func() any {
 		match := modload.MatchInModule(ctx, pattern, m, imports.AnyTags())
 		if len(match.Errs) > 0 {
 			return entry{match.Pkgs, match.Errs[0]}
@@ -893,7 +893,7 @@ func (r *resolver) checkWildcardVersions(ctx context.Context) {
 					// curM at its original version contains a path matching q.pattern,
 					// but at rev.Version it does not, so (somewhat paradoxically) if
 					// we changed the version of curM it would no longer match the query.
-					var version interface{} = m
+					var version any = m
 					if rev.Version != q.version {
 						version = fmt.Sprintf("%s@%s (%s)", m.Path, q.version, m.Version)
 					}
@@ -1124,7 +1124,7 @@ func (r *resolver) loadPackages(ctx context.Context, patterns []string, findPack
 	}
 
 	opts.AllowPackage = func(ctx context.Context, path string, m module.Version) error {
-		if m.Path == "" || m.Version == "" && modload.MainModules.Contains(m.Path) {
+		if m.Path == "" || m.Version == "" {
 			// Packages in the standard library and main modules are already at their
 			// latest (and only) available versions.
 			return nil
@@ -1575,7 +1575,7 @@ func (r *resolver) checkPackageProblems(ctx context.Context, pkgPatterns []strin
 		i := i
 		m := r.buildList[i]
 		mActual := m
-		if mRepl, _ := modload.Replacement(m); mRepl.Path != "" {
+		if mRepl := modload.Replacement(m); mRepl.Path != "" {
 			mActual = mRepl
 		}
 		old := module.Version{Path: m.Path, Version: r.initialVersion[m.Path]}
@@ -1583,7 +1583,7 @@ func (r *resolver) checkPackageProblems(ctx context.Context, pkgPatterns []strin
 			continue
 		}
 		oldActual := old
-		if oldRepl, _ := modload.Replacement(old); oldRepl.Path != "" {
+		if oldRepl := modload.Replacement(old); oldRepl.Path != "" {
 			oldActual = oldRepl
 		}
 		if mActual == oldActual || mActual.Version == "" || !modfetch.HaveSum(oldActual) {

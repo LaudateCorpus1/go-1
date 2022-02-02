@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// TODO(jayconrod): support more platforms.
-//go:build !darwin && !linux && !windows
-// +build !darwin,!linux,!windows
+// If you update this constraint, also update cmd/internal/sys.FuzzSupported.
+//
+//go:build !darwin && !freebsd && !linux && !windows
 
 package fuzz
 

@@ -385,6 +385,9 @@ func libinit(ctxt *Link) {
 	} else if *flagMsan {
 		suffixsep = "_"
 		suffix = "msan"
+	} else if *flagAsan {
+		suffixsep = "_"
+		suffix = "asan"
 	}
 
 	Lflag(ctxt, filepath.Join(buildcfg.GOROOT, "pkg", fmt.Sprintf("%s_%s%s%s", buildcfg.GOOS, buildcfg.GOARCH, suffixsep, suffix)))
@@ -528,6 +531,9 @@ func (ctxt *Link) loadlib() {
 	}
 	if *flagMsan {
 		loadinternal(ctxt, "runtime/msan")
+	}
+	if *flagAsan {
+		loadinternal(ctxt, "runtime/asan")
 	}
 	loadinternal(ctxt, "runtime")
 	for ; i < len(ctxt.Library); i++ {
@@ -1015,6 +1021,7 @@ var internalpkg = []string{
 	"runtime/cgo",
 	"runtime/race",
 	"runtime/msan",
+	"runtime/asan",
 }
 
 func ldhostobj(ld func(*Link, *bio.Reader, string, int64, string), headType objabi.HeadType, f *bio.Reader, pkg string, length int64, pn string, file string) *Hostobj {
@@ -1096,7 +1103,6 @@ func hostlinksetup(ctxt *Link) {
 		*flagTmpdir = dir
 		ownTmpDir = true
 		AtExit(func() {
-			ctxt.Out.Close()
 			os.RemoveAll(*flagTmpdir)
 		})
 	}
@@ -1263,7 +1269,10 @@ func (ctxt *Link) hostlink() {
 		if ctxt.DynlinkingGo() && buildcfg.GOOS != "ios" {
 			// -flat_namespace is deprecated on iOS.
 			// It is useful for supporting plugins. We don't support plugins on iOS.
-			argv = append(argv, "-Wl,-flat_namespace")
+			// -flat_namespace may cause the dynamic linker to hang at forkExec when
+			// resolving a lazy binding. See issue 38824.
+			// Force eager resolution to work around.
+			argv = append(argv, "-Wl,-flat_namespace", "-Wl,-bind_at_load")
 		}
 		if !combineDwarf {
 			argv = append(argv, "-Wl,-S") // suppress STAB (symbolic debugging) symbols
@@ -1492,8 +1501,19 @@ func (ctxt *Link) hostlink() {
 			}
 			return strings.Trim(string(out), "\n")
 		}
-		argv = append(argv, getPathFile("crtcxa.o"))
-		argv = append(argv, getPathFile("crtdbase.o"))
+		// Since GCC version 11, the 64-bit version of GCC starting files
+		// are now suffixed by "_64". Even under "-maix64" multilib directory
+		// "crtcxa.o" is 32-bit.
+		crtcxa := getPathFile("crtcxa_64.o")
+		if !filepath.IsAbs(crtcxa) {
+			crtcxa = getPathFile("crtcxa.o")
+		}
+		crtdbase := getPathFile("crtdbase_64.o")
+		if !filepath.IsAbs(crtdbase) {
+			crtdbase = getPathFile("crtdbase.o")
+		}
+		argv = append(argv, crtcxa)
+		argv = append(argv, crtdbase)
 	}
 
 	if ctxt.linkShared {

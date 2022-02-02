@@ -44,12 +44,12 @@ func (r *intReader) uint64() uint64 {
 
 // Keep this in sync with constants in iexport.go.
 const (
-	iexportVersionGo1_11 = 0
-	iexportVersionPosCol = 1
-	// TODO: before release, change this back to 2.
-	iexportVersionGenerics = iexportVersionPosCol
+	iexportVersionGo1_11   = 0
+	iexportVersionPosCol   = 1
+	iexportVersionGenerics = 2
+	iexportVersionGo1_18   = 2
 
-	iexportVersionCurrent = iexportVersionGenerics
+	iexportVersionCurrent = 2
 )
 
 type ident struct {
@@ -98,13 +98,9 @@ func iImportData(fset *token.FileSet, imports map[string]*types.Package, dataRea
 
 	version = int64(r.uint64())
 	switch version {
-	case /* iexportVersionGenerics, */ iexportVersionPosCol, iexportVersionGo1_11:
+	case iexportVersionGo1_18, iexportVersionPosCol, iexportVersionGo1_11:
 	default:
-		if version > iexportVersionGenerics {
-			errorf("unstable iexport format version %d, just rebuild compiler and std library", version)
-		} else {
-			errorf("unknown iexport format version %d", version)
-		}
+		errorf("unknown iexport format version %d", version)
 	}
 
 	sLen := int64(r.uint64())
@@ -131,13 +127,14 @@ func iImportData(fset *token.FileSet, imports map[string]*types.Package, dataRea
 		typCache: make(map[uint64]types.Type),
 		// Separate map for typeparams, keyed by their package and unique
 		// name (name with subscript).
-		tparamIndex: make(map[ident]types.Type),
+		tparamIndex: make(map[ident]*types.TypeParam),
 
 		fake: fakeFileSet{
 			fset:  fset,
-			files: make(map[string]*token.File),
+			files: make(map[string]*fileInfo),
 		},
 	}
+	defer p.fake.setLines() // set lines for files in fset
 
 	for i, pt := range predeclared {
 		p.typCache[uint64(i)] = pt
@@ -210,7 +207,7 @@ type iimporter struct {
 	declData    []byte
 	pkgIndex    map[*types.Package]map[string]uint64
 	typCache    map[uint64]types.Type
-	tparamIndex map[ident]types.Type
+	tparamIndex map[ident]*types.TypeParam
 
 	fake          fakeFileSet
 	interfaceList []*types.Interface
@@ -258,7 +255,7 @@ func (p *iimporter) pkgAt(off uint64) *types.Package {
 }
 
 func (p *iimporter) typAt(off uint64, base *types.Named) types.Type {
-	if t, ok := p.typCache[off]; ok && (base == nil || !isInterface(t)) {
+	if t, ok := p.typCache[off]; ok && canReuse(base, t) {
 		return t
 	}
 
@@ -270,10 +267,28 @@ func (p *iimporter) typAt(off uint64, base *types.Named) types.Type {
 	r.declReader.Reset(p.declData[off-predeclReserved:])
 	t := r.doType(base)
 
-	if base == nil || !isInterface(t) {
+	if canReuse(base, t) {
 		p.typCache[off] = t
 	}
 	return t
+}
+
+// canReuse reports whether the type rhs on the RHS of the declaration for def
+// may be re-used.
+//
+// Specifically, if def is non-nil and rhs is an interface type with methods, it
+// may not be re-used because we have a convention of setting the receiver type
+// for interface methods to def.
+func canReuse(def *types.Named, rhs types.Type) bool {
+	if def == nil {
+		return true
+	}
+	iface, _ := rhs.(*types.Interface)
+	if iface == nil {
+		return true
+	}
+	// Don't use iface.Empty() here as iface may not be complete.
+	return iface.NumEmbeddeds() == 0 && iface.NumExplicitMethods() == 0
 }
 
 type importReader struct {
@@ -354,19 +369,29 @@ func (r *importReader) obj(name string) {
 		if r.p.exportVersion < iexportVersionGenerics {
 			errorf("unexpected type param type")
 		}
-		// Remove the "path" from the type param name that makes it unique
-		ix := strings.LastIndex(name, ".")
-		if ix < 0 {
-			errorf("missing path for type param")
-		}
-		tn := types.NewTypeName(pos, r.currPkg, name[ix+1:], nil)
+		// Remove the "path" from the type param name that makes it unique,
+		// and revert any unique name used for blank typeparams.
+		name0 := tparamName(name)
+		tn := types.NewTypeName(pos, r.currPkg, name0, nil)
 		t := types.NewTypeParam(tn, nil)
 		// To handle recursive references to the typeparam within its
 		// bound, save the partial type in tparamIndex before reading the bounds.
 		id := ident{r.currPkg.Name(), name}
 		r.p.tparamIndex[id] = t
 
-		t.SetConstraint(r.typ())
+		var implicit bool
+		if r.p.exportVersion >= iexportVersionGo1_18 {
+			implicit = r.bool()
+		}
+		constraint := r.typ()
+		if implicit {
+			iface, _ := constraint.(*types.Interface)
+			if iface == nil {
+				errorf("non-interface constraint marked implicit")
+			}
+			iface.MarkImplicit()
+		}
+		t.SetConstraint(constraint)
 
 	case 'V':
 		typ := r.typ()
@@ -384,6 +409,10 @@ func (r *importReader) declare(obj types.Object) {
 
 func (r *importReader) value() (typ types.Type, val constant.Value) {
 	typ = r.typ()
+	if r.p.exportVersion >= iexportVersionGo1_18 {
+		// TODO: add support for using the kind
+		_ = constant.Kind(r.int64())
+	}
 
 	switch b := typ.Underlying().(*types.Basic); b.Info() & types.IsConstType {
 	case types.IsBoolean:
@@ -740,4 +769,22 @@ func baseType(typ types.Type) *types.Named {
 	// receiver base types are always (possibly generic) types.Named types
 	n, _ := typ.(*types.Named)
 	return n
+}
+
+const blankMarker = "$"
+
+// tparamName returns the real name of a type parameter, after stripping its
+// qualifying prefix and reverting blank-name encoding. See tparamExportName
+// for details.
+func tparamName(exportName string) string {
+	// Remove the "path" from the type param name that makes it unique.
+	ix := strings.LastIndex(exportName, ".")
+	if ix < 0 {
+		errorf("malformed type parameter export name %s: missing prefix", exportName)
+	}
+	name := exportName[ix+1:]
+	if strings.HasPrefix(name, blankMarker) {
+		return "_"
+	}
+	return name
 }

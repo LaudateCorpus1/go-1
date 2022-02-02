@@ -96,6 +96,17 @@ func check2(noders []*noder) {
 	}
 }
 
+// Information about sub-dictionary entries in a dictionary
+type subDictInfo struct {
+	// Call or XDOT node that requires a dictionary.
+	callNode ir.Node
+	// Saved CallExpr.X node (*ir.SelectorExpr or *InstExpr node) for a generic
+	// method or function call, since this node will get dropped when the generic
+	// method/function call is transformed to a call on the instantiated shape
+	// function. Nil for other kinds of calls or XDOTs.
+	savedXNode ir.Node
+}
+
 // dictInfo is the dictionary format for an instantiation of a generic function with
 // particular shapes. shapeParams, derivedTypes, subDictCalls, and itabConvs describe
 // the actual dictionary entries in order, and the remaining fields are other info
@@ -108,7 +119,7 @@ type dictInfo struct {
 	// Nodes in the instantiation that requires a subdictionary. Includes
 	// method and function calls (OCALL), function values (OFUNCINST), method
 	// values/expressions (OXDOT).
-	subDictCalls []ir.Node
+	subDictCalls []subDictInfo
 	// Nodes in the instantiation that are a conversion from a typeparam/derived
 	// type to a specific interface.
 	itabConvs []ir.Node
@@ -158,16 +169,6 @@ type irgen struct {
 	// types which we need to finish, by doing g.fillinMethods.
 	typesToFinalize []*typeDelayInfo
 
-	dnum int // for generating unique dictionary variables
-
-	// Map from a name of function that been instantiated to information about
-	// its instantiated function (including dictionary format).
-	instInfoMap map[*types.Sym]*instInfo
-
-	// dictionary syms which we need to finish, by writing out any itabconv
-	// entries.
-	dictSymsToFinalize []*delayInfo
-
 	// True when we are compiling a top-level generic function or method. Use to
 	// avoid adding closures of generic functions/methods to the target.Decls
 	// list.
@@ -178,6 +179,23 @@ type irgen struct {
 	// can be sure they match up correctly between types2-to-types1 translation
 	// and types1 importing.
 	curDecl string
+}
+
+// genInst has the information for creating needed instantiations and modifying
+// functions to use instantiations.
+type genInst struct {
+	dnum int // for generating unique dictionary variables
+
+	// Map from the names of all instantiations to information about the
+	// instantiations.
+	instInfoMap map[*types.Sym]*instInfo
+
+	// Dictionary syms which we need to finish, by writing out any itabconv
+	// entries.
+	dictSymsToFinalize []*delayInfo
+
+	// New instantiations created during this round of buildInstantiations().
+	newInsts []ir.Node
 }
 
 func (g *irgen) later(fn func()) {
@@ -308,8 +326,9 @@ Outer:
 
 	typecheck.DeclareUniverse()
 
-	// Create any needed stencils of generic functions
-	g.stencil()
+	// Create any needed instantiations of generic functions and transform
+	// existing and new functions to use those instantiations.
+	BuildInstantiations()
 
 	// Remove all generic functions from g.target.Decl, since they have been
 	// used for stenciling, but don't compile. Generic functions will already

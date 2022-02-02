@@ -353,8 +353,14 @@ Script:
 				ok = canCgo
 			case "msan":
 				ok = canMSan
+			case "asan":
+				ok = canASan
 			case "race":
 				ok = canRace
+			case "fuzz":
+				ok = canFuzz
+			case "fuzz-instrumented":
+				ok = fuzzInstrumented
 			case "net":
 				ok = testenv.HasExternalNetwork()
 			case "link":
@@ -368,7 +374,7 @@ Script:
 			default:
 				if strings.HasPrefix(cond.tag, "exec:") {
 					prog := cond.tag[len("exec:"):]
-					ok = execCache.Do(prog, func() interface{} {
+					ok = execCache.Do(prog, func() any {
 						if runtime.GOOS == "plan9" && prog == "git" {
 							// The Git command is usually not the real Git on Plan 9.
 							// See https://golang.org/issues/29640.
@@ -485,6 +491,7 @@ var scriptCmds = map[string]func(*testScript, simpleStatus, []string){
 	"go":      (*testScript).cmdGo,
 	"grep":    (*testScript).cmdGrep,
 	"mkdir":   (*testScript).cmdMkdir,
+	"mv":      (*testScript).cmdMv,
 	"rm":      (*testScript).cmdRm,
 	"skip":    (*testScript).cmdSkip,
 	"stale":   (*testScript).cmdStale,
@@ -579,10 +586,6 @@ func (ts *testScript) cmdChmod(want simpleStatus, args []string) {
 
 // cmp compares two files.
 func (ts *testScript) cmdCmp(want simpleStatus, args []string) {
-	if want != success {
-		// It would be strange to say "this file can have any content except this precise byte sequence".
-		ts.fatalf("unsupported: %v cmp", want)
-	}
 	quiet := false
 	if len(args) > 0 && args[0] == "-q" {
 		quiet = true
@@ -591,14 +594,11 @@ func (ts *testScript) cmdCmp(want simpleStatus, args []string) {
 	if len(args) != 2 {
 		ts.fatalf("usage: cmp file1 file2")
 	}
-	ts.doCmdCmp(args, false, quiet)
+	ts.doCmdCmp(want, args, false, quiet)
 }
 
 // cmpenv compares two files with environment variable substitution.
 func (ts *testScript) cmdCmpenv(want simpleStatus, args []string) {
-	if want != success {
-		ts.fatalf("unsupported: %v cmpenv", want)
-	}
 	quiet := false
 	if len(args) > 0 && args[0] == "-q" {
 		quiet = true
@@ -607,17 +607,18 @@ func (ts *testScript) cmdCmpenv(want simpleStatus, args []string) {
 	if len(args) != 2 {
 		ts.fatalf("usage: cmpenv file1 file2")
 	}
-	ts.doCmdCmp(args, true, quiet)
+	ts.doCmdCmp(want, args, true, quiet)
 }
 
-func (ts *testScript) doCmdCmp(args []string, env, quiet bool) {
+func (ts *testScript) doCmdCmp(want simpleStatus, args []string, env, quiet bool) {
 	name1, name2 := args[0], args[1]
 	var text1, text2 string
-	if name1 == "stdout" {
+	switch name1 {
+	case "stdout":
 		text1 = ts.stdout
-	} else if name1 == "stderr" {
+	case "stderr":
 		text1 = ts.stderr
-	} else {
+	default:
 		data, err := os.ReadFile(ts.mkabs(name1))
 		ts.check(err)
 		text1 = string(data)
@@ -632,14 +633,28 @@ func (ts *testScript) doCmdCmp(args []string, env, quiet bool) {
 		text2 = ts.expand(text2, false)
 	}
 
-	if text1 == text2 {
-		return
-	}
-
-	if !quiet {
+	eq := text1 == text2
+	if !eq && !quiet && want != failure {
 		fmt.Fprintf(&ts.log, "[diff -%s +%s]\n%s\n", name1, name2, diff(text1, text2))
 	}
-	ts.fatalf("%s and %s differ", name1, name2)
+	switch want {
+	case failure:
+		if eq {
+			ts.fatalf("%s and %s do not differ", name1, name2)
+		}
+	case success:
+		if !eq {
+			ts.fatalf("%s and %s differ", name1, name2)
+		}
+	case successOrFailure:
+		if eq {
+			fmt.Fprintf(&ts.log, "%s and %s do not differ\n", name1, name2)
+		} else {
+			fmt.Fprintf(&ts.log, "%s and %s differ\n", name1, name2)
+		}
+	default:
+		ts.fatalf("unsupported: %v cmp", want)
+	}
 }
 
 // cp copies files, maybe eventually directories.
@@ -834,6 +849,16 @@ func (ts *testScript) cmdMkdir(want simpleStatus, args []string) {
 	}
 }
 
+func (ts *testScript) cmdMv(want simpleStatus, args []string) {
+	if want != success {
+		ts.fatalf("unsupported: %v mv", want)
+	}
+	if len(args) != 2 {
+		ts.fatalf("usage: mv old new")
+	}
+	ts.check(os.Rename(ts.mkabs(args[0]), ts.mkabs(args[1])))
+}
+
 // rm removes files or directories.
 func (ts *testScript) cmdRm(want simpleStatus, args []string) {
 	if want != success {
@@ -877,7 +902,7 @@ func (ts *testScript) cmdStale(want simpleStatus, args []string) {
 	tmpl := "{{if .Error}}{{.ImportPath}}: {{.Error.Err}}{{else}}"
 	switch want {
 	case failure:
-		tmpl += "{{if .Stale}}{{.ImportPath}} is unexpectedly stale{{end}}"
+		tmpl += "{{if .Stale}}{{.ImportPath}} is unexpectedly stale: {{.StaleReason}}{{end}}"
 	case success:
 		tmpl += "{{if not .Stale}}{{.ImportPath}} is unexpectedly NOT stale{{end}}"
 	default:
@@ -1303,7 +1328,7 @@ func (ts *testScript) expand(s string, inRegexp bool) string {
 }
 
 // fatalf aborts the test with the given failure message.
-func (ts *testScript) fatalf(format string, args ...interface{}) {
+func (ts *testScript) fatalf(format string, args ...any) {
 	fmt.Fprintf(&ts.log, "FAIL: %s:%d: %s\n", ts.file, ts.lineno, fmt.Sprintf(format, args...))
 	ts.t.FailNow()
 }

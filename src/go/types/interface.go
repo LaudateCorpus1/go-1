@@ -73,6 +73,14 @@ func NewInterfaceType(methods []*Func, embeddeds []Type) *Interface {
 	return typ
 }
 
+// MarkImplicit marks the interface t as implicit, meaning this interface
+// corresponds to a constraint literal such as ~T or A|B without explicit
+// interface embedding. MarkImplicit should be called before any concurrent use
+// of implicit interfaces.
+func (t *Interface) MarkImplicit() {
+	t.implicit = true
+}
+
 // NumExplicitMethods returns the number of explicitly declared methods of interface t.
 func (t *Interface) NumExplicitMethods() int { return len(t.methods) }
 
@@ -103,7 +111,7 @@ func (t *Interface) Method(i int) *Func { return t.typeSet().Method(i) }
 func (t *Interface) Empty() bool { return t.typeSet().IsAll() }
 
 // IsComparable reports whether each type in interface t's type set is comparable.
-func (t *Interface) IsComparable() bool { return t.typeSet().IsComparable() }
+func (t *Interface) IsComparable() bool { return t.typeSet().IsComparable(nil) }
 
 // IsMethodSet reports whether the interface t is fully described by its method
 // set.
@@ -134,9 +142,6 @@ func (t *Interface) String() string   { return TypeString(t, nil) }
 // Implementation
 
 func (check *Checker) interfaceType(ityp *Interface, iface *ast.InterfaceType, def *Named) {
-	var tlist []ast.Expr
-	var tname *ast.Ident // "type" name of first entry in a type list declaration
-
 	addEmbedded := func(pos token.Pos, typ Type) {
 		ityp.embeddeds = append(ityp.embeddeds, typ)
 		if ityp.embedPos == nil {
@@ -147,42 +152,16 @@ func (check *Checker) interfaceType(ityp *Interface, iface *ast.InterfaceType, d
 
 	for _, f := range iface.Methods.List {
 		if len(f.Names) == 0 {
-			addEmbedded(f.Type.Pos(), parseUnion(check, flattenUnion(nil, f.Type)))
+			addEmbedded(f.Type.Pos(), parseUnion(check, f.Type))
 			continue
 		}
+		// f.Name != nil
 
-		// We have a method with name f.Names[0], or a type
-		// of a type list (name.Name == "type").
-		// (The parser ensures that there's only one method
-		// and we don't care if a constructed AST has more.)
+		// We have a method with name f.Names[0].
 		name := f.Names[0]
 		if name.Name == "_" {
 			check.errorf(name, _BlankIfaceMethod, "invalid method name _")
 			continue // ignore
-		}
-
-		// TODO(rfindley) Remove type list handling once the parser doesn't accept type lists anymore.
-		if name.Name == "type" {
-			// Report an error for the first type list per interface
-			// if we don't allow type lists, but continue.
-			if !allowTypeLists && tlist == nil {
-				check.softErrorf(name, _Todo, "use generalized embedding syntax instead of a type list")
-			}
-			// For now, collect all type list entries as if it
-			// were a single union, where each union element is
-			// of the form ~T.
-			// TODO(rfindley) remove once we disallow type lists
-			op := new(ast.UnaryExpr)
-			op.Op = token.TILDE
-			op.X = f.Type
-			tlist = append(tlist, op)
-			// Report an error if we have multiple type lists in an
-			// interface, but only if they are permitted in the first place.
-			if allowTypeLists && tname != nil && tname != name {
-				check.errorf(name, _Todo, "cannot have multiple type lists in an interface")
-			}
-			tname = name
-			continue
 		}
 
 		typ := check.typ(f.Type)
@@ -202,7 +181,7 @@ func (check *Checker) interfaceType(ityp *Interface, iface *ast.InterfaceType, d
 			if ftyp, _ := f.Type.(*ast.FuncType); ftyp != nil && ftyp.TypeParams != nil {
 				at = ftyp.TypeParams
 			}
-			check.errorf(at, _Todo, "methods cannot have type parameters")
+			check.errorf(at, _InvalidMethodTypeParams, "methods cannot have type parameters")
 		}
 
 		// use named receiver type if available (for better error messages)
@@ -215,13 +194,6 @@ func (check *Checker) interfaceType(ityp *Interface, iface *ast.InterfaceType, d
 		m := NewFunc(name.Pos(), check.pkg, name.Name, sig)
 		check.recordDef(name, m)
 		ityp.methods = append(ityp.methods, m)
-	}
-
-	// type constraints
-	if tlist != nil {
-		// TODO(rfindley): this differs from types2 due to the use of Pos() below,
-		// which should actually be on the ~. Confirm that this position is correct.
-		addEmbedded(tlist[0].Pos(), parseUnion(check, tlist))
 	}
 
 	// All methods and embedded elements for this interface are collected;
@@ -249,13 +221,5 @@ func (check *Checker) interfaceType(ityp *Interface, iface *ast.InterfaceType, d
 	check.later(func() {
 		computeInterfaceTypeSet(check, iface.Pos(), ityp)
 		ityp.check = nil
-	})
-}
-
-func flattenUnion(list []ast.Expr, x ast.Expr) []ast.Expr {
-	if o, _ := x.(*ast.BinaryExpr); o != nil && o.Op == token.OR {
-		list = flattenUnion(list, o.X)
-		x = o.Y
-	}
-	return append(list, x)
+	}).describef(iface, "compute type set for %s", ityp)
 }

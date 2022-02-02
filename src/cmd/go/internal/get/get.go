@@ -17,10 +17,10 @@ import (
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
 	"cmd/go/internal/search"
+	"cmd/go/internal/str"
 	"cmd/go/internal/vcs"
 	"cmd/go/internal/web"
 	"cmd/go/internal/work"
-	"cmd/internal/str"
 
 	"golang.org/x/mod/module"
 )
@@ -446,7 +446,8 @@ func downloadPackage(p *load.Package) error {
 
 	if p.Internal.Build.SrcRoot != "" {
 		// Directory exists. Look for checkout along path to src.
-		repoDir, vcsCmd, err = vcs.FromDir(p.Dir, p.Internal.Build.SrcRoot)
+		const allowNesting = false
+		repoDir, vcsCmd, err = vcs.FromDir(p.Dir, p.Internal.Build.SrcRoot, allowNesting)
 		if err != nil {
 			return err
 		}

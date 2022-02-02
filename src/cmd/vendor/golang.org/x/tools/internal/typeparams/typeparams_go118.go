@@ -9,58 +9,8 @@ package typeparams
 
 import (
 	"go/ast"
-	"go/token"
 	"go/types"
 )
-
-// GetIndexExprData extracts data from AST nodes that represent index
-// expressions.
-//
-// For an ast.IndexExpr, the resulting IndexExprData will have exactly one
-// index expression. For an ast.IndexListExpr (go1.18+), it may have a
-// variable number of index expressions.
-//
-// For nodes that don't represent index expressions, GetIndexExprData returns
-// nil.
-// TODO(rfindley): remove this function in favor of using the alias below.
-func GetIndexExprData(n ast.Node) *IndexExprData {
-	switch e := n.(type) {
-	case *ast.IndexExpr:
-		return &IndexExprData{
-			X:       e.X,
-			Lbrack:  e.Lbrack,
-			Indices: []ast.Expr{e.Index},
-			Rbrack:  e.Rbrack,
-		}
-	case *ast.IndexListExpr:
-		return (*IndexExprData)(e)
-	}
-	return nil
-}
-
-// PackIndexExpr returns an *ast.IndexExpr or *ast.IndexListExpr, depending on
-// the cardinality of indices. Calling PackIndexExpr with len(indices) == 0
-// will panic.
-func PackIndexExpr(x ast.Expr, lbrack token.Pos, indices []ast.Expr, rbrack token.Pos) ast.Expr {
-	switch len(indices) {
-	case 0:
-		panic("empty indices")
-	case 1:
-		return &ast.IndexExpr{
-			X:      x,
-			Lbrack: lbrack,
-			Index:  indices[0],
-			Rbrack: rbrack,
-		}
-	default:
-		return &ast.IndexListExpr{
-			X:       x,
-			Lbrack:  lbrack,
-			Indices: indices,
-			Rbrack:  rbrack,
-		}
-	}
-}
 
 // IndexListExpr is an alias for ast.IndexListExpr.
 type IndexListExpr = ast.IndexListExpr
@@ -125,6 +75,16 @@ func IsMethodSet(iface *types.Interface) bool {
 	return iface.IsMethodSet()
 }
 
+// IsImplicit calls iface.IsImplicit().
+func IsImplicit(iface *types.Interface) bool {
+	return iface.IsImplicit()
+}
+
+// MarkImplicit calls iface.MarkImplicit().
+func MarkImplicit(iface *types.Interface) {
+	iface.MarkImplicit()
+}
+
 // ForNamed extracts the (possibly empty) type parameter object list from
 // named.
 func ForNamed(named *types.Named) *TypeParamList {
@@ -169,15 +129,12 @@ func InitInstanceInfo(info *types.Info) {
 	info.Instances = make(map[*ast.Ident]types.Instance)
 }
 
-// GetInstance extracts information about the instantiation occurring at the
-// identifier id. id should be the identifier denoting a parameterized type or
-// function in an instantiation expression or function call.
-func GetInstance(info *types.Info, id *ast.Ident) (*TypeList, types.Type) {
-	if info.Instances != nil {
-		inf := info.Instances[id]
-		return inf.TypeArgs, inf.Type
-	}
-	return nil, nil
+// Instance is an alias for types.Instance.
+type Instance = types.Instance
+
+// GetInstances returns info.Instances.
+func GetInstances(info *types.Info) map[*ast.Ident]Instance {
+	return info.Instances
 }
 
 // Context is an alias for types.Context.

@@ -34,8 +34,9 @@ import (
 	"cmd/go/internal/fsys"
 	"cmd/go/internal/load"
 	"cmd/go/internal/modload"
+	"cmd/go/internal/str"
 	"cmd/go/internal/trace"
-	"cmd/internal/str"
+	"cmd/internal/quoted"
 	"cmd/internal/sys"
 )
 
@@ -235,11 +236,13 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 		}
 	} else if p.Goroot {
 		// The Go compiler always hides the exact value of $GOROOT
-		// when building things in GOROOT, but the C compiler
-		// merely rewrites GOROOT to GOROOT_FINAL.
-		if len(p.CFiles) > 0 {
-			fmt.Fprintf(h, "goroot %s\n", cfg.GOROOT_FINAL)
-		}
+		// when building things in GOROOT.
+		//
+		// The C compiler does not, but for packages in GOROOT we rewrite the path
+		// as though -trimpath were set, so that we don't invalidate the build cache
+		// (and especially any precompiled C archive files) when changing
+		// GOROOT_FINAL. (See https://go.dev/issue/50183.)
+		//
 		// b.WorkDir is always either trimmed or rewritten to
 		// the literal string "/tmp/go-build".
 	} else if !strings.HasPrefix(p.Dir, b.WorkDir) {
@@ -793,10 +796,13 @@ OverlayLoop:
 	}
 
 	if p.Internal.BuildInfo != "" && cfg.ModulesEnabled {
-		if err := b.writeFile(objdir+"_gomod_.go", modload.ModInfoProg(p.Internal.BuildInfo, cfg.BuildToolchainName == "gccgo")); err != nil {
-			return err
+		prog := modload.ModInfoProg(p.Internal.BuildInfo, cfg.BuildToolchainName == "gccgo")
+		if len(prog) > 0 {
+			if err := b.writeFile(objdir+"_gomod_.go", prog); err != nil {
+				return err
+			}
+			gofiles = append(gofiles, objdir+"_gomod_.go")
 		}
-		gofiles = append(gofiles, objdir+"_gomod_.go")
 	}
 
 	// Compile Go.
@@ -1393,6 +1399,7 @@ func (b *Builder) writeLinkImportcfg(a *Action, file string) error {
 			fmt.Fprintf(&icfg, "packageshlib %s=%s\n", p1.ImportPath, p1.Shlib)
 		}
 	}
+	fmt.Fprintf(&icfg, "modinfo %q\n", modload.ModInfoData(a.Package.Internal.BuildInfo))
 	return b.writeFile(file, icfg.Bytes())
 }
 
@@ -1943,7 +1950,7 @@ func mayberemovefile(s string) {
 //	fmtcmd replaces the name of the current directory with dot (.)
 //	but only when it is at the beginning of a space-separated token.
 //
-func (b *Builder) fmtcmd(dir string, format string, args ...interface{}) string {
+func (b *Builder) fmtcmd(dir string, format string, args ...any) string {
 	cmd := fmt.Sprintf(format, args...)
 	if dir != "" && dir != "/" {
 		dot := " ."
@@ -1969,7 +1976,7 @@ func (b *Builder) fmtcmd(dir string, format string, args ...interface{}) string 
 
 // showcmd prints the given command to standard output
 // for the implementation of -n or -x.
-func (b *Builder) Showcmd(dir string, format string, args ...interface{}) {
+func (b *Builder) Showcmd(dir string, format string, args ...any) {
 	b.output.Lock()
 	defer b.output.Unlock()
 	b.Print(b.fmtcmd(dir, format, args...) + "\n")
@@ -2033,7 +2040,7 @@ var cgoTypeSigRe = lazyregexp.New(`\b_C2?(type|func|var|macro)_\B`)
 // run runs the command given by cmdline in the directory dir.
 // If the command fails, run prints information about the failure
 // and returns a non-nil error.
-func (b *Builder) run(a *Action, dir string, desc string, env []string, cmdargs ...interface{}) error {
+func (b *Builder) run(a *Action, dir string, desc string, env []string, cmdargs ...any) error {
 	out, err := b.runOut(a, dir, env, cmdargs...)
 	if len(out) > 0 {
 		if desc == "" {
@@ -2067,7 +2074,7 @@ func (b *Builder) processOutput(out []byte) string {
 // runOut runs the command given by cmdline in the directory dir.
 // It returns the command output and any errors that occurred.
 // It accumulates execution time in a.
-func (b *Builder) runOut(a *Action, dir string, env []string, cmdargs ...interface{}) ([]byte, error) {
+func (b *Builder) runOut(a *Action, dir string, env []string, cmdargs ...any) ([]byte, error) {
 	cmdline := str.StringList(cmdargs...)
 
 	for _, arg := range cmdline {
@@ -2332,7 +2339,7 @@ func (b *Builder) ccompile(a *Action, p *load.Package, outfile string, flags []s
 	// directives pointing to the source directory. It should not generate those
 	// when -trimpath is enabled.
 	if b.gccSupportsFlag(compiler, "-fdebug-prefix-map=a=b") {
-		if cfg.BuildTrimpath {
+		if cfg.BuildTrimpath || p.Goroot {
 			// Keep in sync with Action.trimpath.
 			// The trimmed paths are a little different, but we need to trim in the
 			// same situations.
@@ -2354,8 +2361,6 @@ func (b *Builder) ccompile(a *Action, p *load.Package, outfile string, flags []s
 				to = filepath.Join("/_", toPath)
 			}
 			flags = append(flags[:len(flags):len(flags)], "-fdebug-prefix-map="+from+"="+to)
-		} else if p.Goroot && cfg.GOROOT_FINAL != cfg.GOROOT {
-			flags = append(flags[:len(flags):len(flags)], "-fdebug-prefix-map="+cfg.GOROOT+"="+cfg.GOROOT_FINAL)
 		}
 	}
 
@@ -2404,7 +2409,7 @@ func (b *Builder) gccld(a *Action, p *load.Package, objdir, outfile string, flag
 		cmd = b.GccCmd(p.Dir, objdir)
 	}
 
-	cmdargs := []interface{}{cmd, "-o", outfile, objs, flags}
+	cmdargs := []any{cmd, "-o", outfile, objs, flags}
 	dir := p.Dir
 	out, err := b.runOut(a, base.Cwd(), b.cCompilerEnv(), cmdargs...)
 
@@ -2666,7 +2671,7 @@ func envList(key, def string) []string {
 	if v == "" {
 		v = def
 	}
-	args, err := str.SplitQuotedFields(v)
+	args, err := quoted.Split(v)
 	if err != nil {
 		panic(fmt.Sprintf("could not parse environment variable %s with value %q: %v", key, v, err))
 	}
@@ -2736,6 +2741,10 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 		cgoCFLAGS = append([]string{"-fsanitize=memory"}, cgoCFLAGS...)
 		cgoLDFLAGS = append([]string{"-fsanitize=memory"}, cgoLDFLAGS...)
 	}
+	if cfg.BuildASan {
+		cgoCFLAGS = append([]string{"-fsanitize=address"}, cgoCFLAGS...)
+		cgoLDFLAGS = append([]string{"-fsanitize=address"}, cgoLDFLAGS...)
+	}
 
 	// Allows including _cgo_export.h, as well as the user's .h files,
 	// from .[ch] files in the package.
@@ -2757,7 +2766,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 	if p.Standard && p.ImportPath == "runtime/cgo" {
 		cgoflags = append(cgoflags, "-import_runtime_cgo=false")
 	}
-	if p.Standard && (p.ImportPath == "runtime/race" || p.ImportPath == "runtime/msan" || p.ImportPath == "runtime/cgo") {
+	if p.Standard && (p.ImportPath == "runtime/race" || p.ImportPath == "runtime/msan" || p.ImportPath == "runtime/cgo" || p.ImportPath == "runtime/asan") {
 		cgoflags = append(cgoflags, "-import_syscall=false")
 	}
 

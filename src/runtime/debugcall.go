@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 //go:build amd64
-// +build amd64
 
 package runtime
 
@@ -17,7 +16,7 @@ const (
 )
 
 func debugCallV2()
-func debugCallPanicked(val interface{})
+func debugCallPanicked(val any)
 
 // debugCallCheck checks whether it is safe to inject a debugger
 // function call with return PC pc. If not, it returns a string

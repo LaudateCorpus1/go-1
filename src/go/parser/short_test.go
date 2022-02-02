@@ -119,11 +119,11 @@ var validWithTParamsOnly = []string{
 	`package p; func _(T[P] /* ERROR "missing element type" */ ) T[P]`,
 	`package p; type _ struct{ T[P] /* ERROR "missing element type" */ }`,
 	`package p; type _ struct{ T[struct /* ERROR "expected expression" */ {a, b, c int}] }`,
-	`package p; type _ interface{type /* ERROR "expected '}', found 'type'" */ int}`,
-	`package p; type _ interface{type /* ERROR "expected '}', found 'type'" */ int, float32; type bool; m(); type string;}`,
+	`package p; type _ interface{int| /* ERROR "expected ';'" */ float32; bool; m(); string;}`,
 	`package p; type I1[T any /* ERROR "expected ']', found any" */ ] interface{}; type I2 interface{ I1[int] }`,
 	`package p; type I1[T any /* ERROR "expected ']', found any" */ ] interface{}; type I2[T any] interface{ I1[T] }`,
 	`package p; type _ interface { f[ /* ERROR "expected ';', found '\['" */ T any]() }`,
+	`package p; type T[P any /* ERROR "expected ']'" */ ] = T0`,
 }
 
 func TestValid(t *testing.T) {
@@ -241,7 +241,6 @@ var invalidNoTParamErrs = []string{
 // error messages produced when ParseTypeParams is set.
 var invalidTParamErrs = []string{
 	`package p; type _[_ any] int; var _ = T[] /* ERROR "expected operand" */ {}`,
-	`package p; type T[P any] = /* ERROR "cannot be alias" */ T0`,
 	`package p; var _ func[ /* ERROR "cannot have type parameters" */ T any](T)`,
 	`package p; func _[]/* ERROR "empty type parameter list" */()`,
 

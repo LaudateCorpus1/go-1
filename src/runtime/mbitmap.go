@@ -417,6 +417,15 @@ func findObject(p, refBase, refOff uintptr) (base uintptr, s *mspan, objIndex ui
 	return
 }
 
+// verifyNotInHeapPtr reports whether converting the not-in-heap pointer into a unsafe.Pointer is ok.
+//go:linkname reflect_verifyNotInHeapPtr reflect.verifyNotInHeapPtr
+func reflect_verifyNotInHeapPtr(p uintptr) bool {
+	// Conversion to a pointer is ok as long as findObject above does not call badPointer.
+	// Since we're already promised that p doesn't point into the heap, just disallow heap
+	// pointers and the special clobbered pointer.
+	return spanOf(p) == nil && p != clobberdeadPtr
+}
+
 // next returns the heapBits describing the next pointer-sized word in memory.
 // That is, if h describes address p, h.next() describes p+ptrSize.
 // Note that next does not modify h. The caller must record the result.
@@ -1943,7 +1952,7 @@ func getgcmaskcb(frame *stkframe, ctxt unsafe.Pointer) bool {
 // gcbits returns the GC type info for x, for testing.
 // The result is the bitmap entries (0 or 1), one entry per byte.
 //go:linkname reflect_gcbits reflect.gcbits
-func reflect_gcbits(x interface{}) []byte {
+func reflect_gcbits(x any) []byte {
 	ret := getgcmask(x)
 	typ := (*ptrtype)(unsafe.Pointer(efaceOf(&x)._type)).elem
 	nptr := typ.ptrdata / goarch.PtrSize
@@ -1956,7 +1965,7 @@ func reflect_gcbits(x interface{}) []byte {
 // Returns GC type info for the pointer stored in ep for testing.
 // If ep points to the stack, only static live information will be returned
 // (i.e. not for objects which are only dynamically live stack objects).
-func getgcmask(ep interface{}) (mask []byte) {
+func getgcmask(ep any) (mask []byte) {
 	e := *efaceOf(&ep)
 	p := e.data
 	t := e._type

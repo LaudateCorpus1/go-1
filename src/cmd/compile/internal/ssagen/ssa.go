@@ -108,6 +108,8 @@ func InitConfig() {
 	ir.Syms.Msanread = typecheck.LookupRuntimeFunc("msanread")
 	ir.Syms.Msanwrite = typecheck.LookupRuntimeFunc("msanwrite")
 	ir.Syms.Msanmove = typecheck.LookupRuntimeFunc("msanmove")
+	ir.Syms.Asanread = typecheck.LookupRuntimeFunc("asanread")
+	ir.Syms.Asanwrite = typecheck.LookupRuntimeFunc("asanwrite")
 	ir.Syms.Newobject = typecheck.LookupRuntimeFunc("newobject")
 	ir.Syms.Newproc = typecheck.LookupRuntimeFunc("newproc")
 	ir.Syms.Panicdivide = typecheck.LookupRuntimeFunc("panicdivide")
@@ -481,6 +483,19 @@ func buildssa(fn *ir.Func, worker int) *ssa.Func {
 
 	var params *abi.ABIParamResultInfo
 	params = s.f.ABISelf.ABIAnalyze(fn.Type(), true)
+
+	// The backend's stackframe pass prunes away entries from the fn's
+	// Dcl list, including PARAMOUT nodes that correspond to output
+	// params passed in registers. Walk the Dcl list and capture these
+	// nodes to a side list, so that we'll have them available during
+	// DWARF-gen later on. See issue 48573 for more details.
+	var debugInfo ssa.FuncDebug
+	for _, n := range fn.Dcl {
+		if n.Class == ir.PPARAMOUT && n.IsOutputParamInRegisters() {
+			debugInfo.RegOutputParams = append(debugInfo.RegOutputParams, n)
+		}
+	}
+	fn.DebugInfo = &debugInfo
 
 	// Generate addresses of local declarations
 	s.decladdrs = map[*ir.Name]*ssa.Value{}
@@ -1245,10 +1260,10 @@ func (s *state) instrument(t *types.Type, addr *ssa.Value, kind instrumentKind) 
 }
 
 // instrumentFields instruments a read/write operation on addr.
-// If it is instrumenting for MSAN and t is a struct type, it instruments
+// If it is instrumenting for MSAN or ASAN and t is a struct type, it instruments
 // operation for each field, instead of for the whole struct.
 func (s *state) instrumentFields(t *types.Type, addr *ssa.Value, kind instrumentKind) {
-	if !base.Flag.MSan || !t.IsStruct() {
+	if !(base.Flag.MSan || base.Flag.ASan) || !t.IsStruct() {
 		s.instrument(t, addr, kind)
 		return
 	}
@@ -1327,6 +1342,16 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 		default:
 			panic("unreachable")
 		}
+	} else if base.Flag.ASan {
+		switch kind {
+		case instrumentRead:
+			fn = ir.Syms.Asanread
+		case instrumentWrite:
+			fn = ir.Syms.Asanwrite
+		default:
+			panic("unreachable")
+		}
+		needWidth = true
 	} else {
 		panic("unreachable")
 	}
@@ -2421,6 +2446,38 @@ func (s *state) conv(n ir.Node, v *ssa.Value, ft, tt *types.Type) *ssa.Value {
 		return s.newValue1(op, tt, v)
 	}
 
+	if ft.IsComplex() && tt.IsComplex() {
+		var op ssa.Op
+		if ft.Size() == tt.Size() {
+			switch ft.Size() {
+			case 8:
+				op = ssa.OpRound32F
+			case 16:
+				op = ssa.OpRound64F
+			default:
+				s.Fatalf("weird complex conversion %v -> %v", ft, tt)
+			}
+		} else if ft.Size() == 8 && tt.Size() == 16 {
+			op = ssa.OpCvt32Fto64F
+		} else if ft.Size() == 16 && tt.Size() == 8 {
+			op = ssa.OpCvt64Fto32F
+		} else {
+			s.Fatalf("weird complex conversion %v -> %v", ft, tt)
+		}
+		ftp := types.FloatForComplex(ft)
+		ttp := types.FloatForComplex(tt)
+		return s.newValue2(ssa.OpComplexMake, tt,
+			s.newValueOrSfCall1(op, ttp, s.newValue1(ssa.OpComplexReal, ftp, v)),
+			s.newValueOrSfCall1(op, ttp, s.newValue1(ssa.OpComplexImag, ftp, v)))
+	}
+
+	if tt.IsComplex() { // and ft is not complex
+		// Needed for generics support - can't happen in normal Go code.
+		et := types.FloatForComplex(tt)
+		v = s.conv(n, v, ft, et)
+		return s.newValue2(ssa.OpComplexMake, tt, v, s.zeroVal(et))
+	}
+
 	if ft.IsFloat() || tt.IsFloat() {
 		conv, ok := fpConvOpToSSA[twoTypes{s.concreteEtype(ft), s.concreteEtype(tt)}]
 		if s.config.RegSize == 4 && Arch.LinkArch.Family != sys.MIPS && !s.softFloat {
@@ -2492,31 +2549,6 @@ func (s *state) conv(n ir.Node, v *ssa.Value, ft, tt *types.Type) *ssa.Value {
 		}
 		s.Fatalf("weird float to unsigned integer conversion %v -> %v", ft, tt)
 		return nil
-	}
-
-	if ft.IsComplex() && tt.IsComplex() {
-		var op ssa.Op
-		if ft.Size() == tt.Size() {
-			switch ft.Size() {
-			case 8:
-				op = ssa.OpRound32F
-			case 16:
-				op = ssa.OpRound64F
-			default:
-				s.Fatalf("weird complex conversion %v -> %v", ft, tt)
-			}
-		} else if ft.Size() == 8 && tt.Size() == 16 {
-			op = ssa.OpCvt32Fto64F
-		} else if ft.Size() == 16 && tt.Size() == 8 {
-			op = ssa.OpCvt64Fto32F
-		} else {
-			s.Fatalf("weird complex conversion %v -> %v", ft, tt)
-		}
-		ftp := types.FloatForComplex(ft)
-		ttp := types.FloatForComplex(tt)
-		return s.newValue2(ssa.OpComplexMake, tt,
-			s.newValueOrSfCall1(op, ttp, s.newValue1(ssa.OpComplexReal, ftp, v)),
-			s.newValueOrSfCall1(op, ttp, s.newValue1(ssa.OpComplexImag, ftp, v)))
 	}
 
 	s.Fatalf("unhandled OCONV %s -> %s", ft.Kind(), tt.Kind())
@@ -3002,7 +3034,7 @@ func (s *state) exprCheckPtr(n ir.Node, checkPtrOK bool) *ssa.Value {
 		}
 		// If n is addressable and can't be represented in
 		// SSA, then load just the selected field. This
-		// prevents false memory dependencies in race/msan
+		// prevents false memory dependencies in race/msan/asan
 		// instrumentation.
 		if ir.IsAddressable(n) && !s.canSSA(n) {
 			p := s.addr(n)
@@ -4421,7 +4453,7 @@ func InitTables() {
 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 			return s.newValue1(ssa.OpBitLen32, types.Types[types.TINT], args[0])
 		},
-		sys.AMD64, sys.ARM64)
+		sys.AMD64, sys.ARM64, sys.PPC64)
 	addF("math/bits", "Len32",
 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 			if s.config.PtrSize == 4 {
@@ -4430,7 +4462,7 @@ func InitTables() {
 			x := s.newValue1(ssa.OpZeroExt32to64, types.Types[types.TUINT64], args[0])
 			return s.newValue1(ssa.OpBitLen64, types.Types[types.TINT], x)
 		},
-		sys.ARM, sys.S390X, sys.MIPS, sys.PPC64, sys.Wasm)
+		sys.ARM, sys.S390X, sys.MIPS, sys.Wasm)
 	addF("math/bits", "Len16",
 		func(s *state, n *ir.CallExpr, args []*ssa.Value) *ssa.Value {
 			if s.config.PtrSize == 4 {
@@ -5063,6 +5095,18 @@ func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool) *ssa.Val
 		for _, p := range params.InParams() { // includes receiver for interface calls
 			ACArgs = append(ACArgs, p.Type)
 		}
+
+		// Split the entry block if there are open defers, because later calls to
+		// openDeferSave may cause a mismatch between the mem for an OpDereference
+		// and the call site which uses it. See #49282.
+		if s.curBlock.ID == s.f.Entry.ID && s.hasOpenDefers {
+			b := s.endBlock()
+			b.Kind = ssa.BlockPlain
+			curb := s.f.NewBlock(ssa.BlockPlain)
+			b.AddEdgeTo(curb)
+			s.startBlock(curb)
+		}
+
 		for i, n := range args {
 			callArgs = append(callArgs, s.putArg(n, t.Params().Field(i).Type))
 		}
@@ -6540,6 +6584,22 @@ func (s *State) DebugFriendlySetPosFrom(v *ssa.Value) {
 			// explicit statement boundaries should appear
 			// in the generated code.
 			if p.IsStmt() != src.PosIsStmt {
+				if s.pp.Pos.IsStmt() == src.PosIsStmt && s.pp.Pos.SameFileAndLine(p) {
+					// If s.pp.Pos already has a statement mark, then it was set here (below) for
+					// the previous value.  If an actual instruction had been emitted for that
+					// value, then the statement mark would have been reset.  Since the statement
+					// mark of s.pp.Pos was not reset, this position (file/line) still needs a
+					// statement mark on an instruction.  If file and line for this value are
+					// the same as the previous value, then the first instruction for this
+					// value will work to take the statement mark.  Return early to avoid
+					// resetting the statement mark.
+					//
+					// The reset of s.pp.Pos occurs in (*Progs).Prog() -- if it emits
+					// an instruction, and the instruction's statement mark was set,
+					// and it is not one of the LosesStmtMark instructions,
+					// then Prog() resets the statement mark on the (*Progs).Pos.
+					return
+				}
 				p = p.WithNotStmt()
 				// Calls use the pos attached to v, but copy the statement mark from State
 			}
@@ -6717,6 +6777,7 @@ func genssa(f *ssa.Func, pp *objw.Progs) {
 
 	s.livenessMap, s.partLiveArgs = liveness.Compute(e.curfn, f, e.stkptrsize, pp)
 	emitArgInfo(e, f, pp)
+	argLiveBlockMap, argLiveValueMap := liveness.ArgLiveness(e.curfn, f, pp)
 
 	openDeferInfo := e.curfn.LSym.Func().OpenCodedDeferInfo
 	if openDeferInfo != nil {
@@ -6774,10 +6835,13 @@ func genssa(f *ssa.Func, pp *objw.Progs) {
 	// Progs that are in the set above and have that source position.
 	var inlMarksByPos map[src.XPos][]*obj.Prog
 
+	var argLiveIdx int = -1 // argument liveness info index
+
 	// Emit basic blocks
 	for i, b := range f.Blocks {
 		s.bstart[b.ID] = s.pp.Next
 		s.lineRunStart = nil
+		s.SetPos(s.pp.Pos.WithNotStmt()) // It needs a non-empty Pos, but cannot be a statement boundary (yet).
 
 		// Attach a "default" liveness info. Normally this will be
 		// overwritten in the Values loop below for each Value. But
@@ -6786,6 +6850,13 @@ func genssa(f *ssa.Func, pp *objw.Progs) {
 		// control instruction. Just mark it something that is
 		// preemptible, unless this function is "all unsafe".
 		s.pp.NextLive = objw.LivenessIndex{StackMapIndex: -1, IsUnsafePoint: liveness.IsUnsafe(f)}
+
+		if idx, ok := argLiveBlockMap[b.ID]; ok && idx != argLiveIdx {
+			argLiveIdx = idx
+			p := s.pp.Prog(obj.APCDATA)
+			p.From.SetConst(objabi.PCDATA_ArgLiveIndex)
+			p.To.SetConst(int64(idx))
+		}
 
 		// Emit values in block
 		Arch.SSAMarkMoves(&s, b)
@@ -6841,6 +6912,13 @@ func genssa(f *ssa.Func, pp *objw.Progs) {
 
 				// let the backend handle it
 				Arch.SSAGenValue(&s, v)
+			}
+
+			if idx, ok := argLiveValueMap[v.ID]; ok && idx != argLiveIdx {
+				argLiveIdx = idx
+				p := s.pp.Prog(obj.APCDATA)
+				p.From.SetConst(objabi.PCDATA_ArgLiveIndex)
+				p.To.SetConst(int64(idx))
 			}
 
 			if base.Ctxt.Flag_locationlists {
@@ -6962,12 +7040,12 @@ func genssa(f *ssa.Func, pp *objw.Progs) {
 
 	if base.Ctxt.Flag_locationlists {
 		var debugInfo *ssa.FuncDebug
+		debugInfo = e.curfn.DebugInfo.(*ssa.FuncDebug)
 		if e.curfn.ABI == obj.ABIInternal && base.Flag.N != 0 {
-			debugInfo = ssa.BuildFuncDebugNoOptimized(base.Ctxt, f, base.Debug.LocationLists > 1, StackOffset)
+			ssa.BuildFuncDebugNoOptimized(base.Ctxt, f, base.Debug.LocationLists > 1, StackOffset, debugInfo)
 		} else {
-			debugInfo = ssa.BuildFuncDebug(base.Ctxt, f, base.Debug.LocationLists > 1, StackOffset)
+			ssa.BuildFuncDebug(base.Ctxt, f, base.Debug.LocationLists > 1, StackOffset, debugInfo)
 		}
-		e.curfn.DebugInfo = debugInfo
 		bstart := s.bstart
 		idToIdx := make([]int, f.NumBlocks())
 		for i, b := range f.Blocks {

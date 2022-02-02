@@ -2,8 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build darwin || linux || windows
-// +build darwin linux windows
+//go:build darwin || freebsd || linux || windows
 
 package fuzz
 
@@ -14,14 +13,17 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 func TestMinimizeInput(t *testing.T) {
 	type testcase struct {
 		name     string
 		fn       func(CorpusEntry) error
-		input    []interface{}
-		expected []interface{}
+		input    []any
+		expected []any
 	}
 	cases := []testcase{
 		{
@@ -39,8 +41,8 @@ func TestMinimizeInput(t *testing.T) {
 				}
 				return nil
 			},
-			input:    []interface{}{[]byte{0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
-			expected: []interface{}{[]byte{1, 1, 1}},
+			input:    []any{[]byte{0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+			expected: []any{[]byte{1, 1, 1}},
 		},
 		{
 			name: "single_bytes",
@@ -54,8 +56,8 @@ func TestMinimizeInput(t *testing.T) {
 				}
 				return fmt.Errorf("bad %v", e.Values[0])
 			},
-			input:    []interface{}{[]byte{1, 2, 3, 4, 5}},
-			expected: []interface{}{[]byte{2, 3}},
+			input:    []any{[]byte{1, 2, 3, 4, 5}},
+			expected: []any{[]byte("00")},
 		},
 		{
 			name: "set_of_bytes",
@@ -69,8 +71,20 @@ func TestMinimizeInput(t *testing.T) {
 				}
 				return nil
 			},
-			input:    []interface{}{[]byte{0, 1, 2, 3, 4, 5}},
-			expected: []interface{}{[]byte{0, 4, 5}},
+			input:    []any{[]byte{0, 1, 2, 3, 4, 5}},
+			expected: []any{[]byte{0, 4, 5}},
+		},
+		{
+			name: "non_ascii_bytes",
+			fn: func(e CorpusEntry) error {
+				b := e.Values[0].([]byte)
+				if len(b) == 3 {
+					return fmt.Errorf("bad %v", e.Values[0])
+				}
+				return nil
+			},
+			input:    []any{[]byte("ท")}, // ท is 3 bytes
+			expected: []any{[]byte("000")},
 		},
 		{
 			name: "ones_string",
@@ -87,153 +101,34 @@ func TestMinimizeInput(t *testing.T) {
 				}
 				return nil
 			},
-			input:    []interface{}{"001010001000000000000000000"},
-			expected: []interface{}{"111"},
+			input:    []any{"001010001000000000000000000"},
+			expected: []any{"111"},
 		},
 		{
-			name: "int",
+			name: "string_length",
 			fn: func(e CorpusEntry) error {
-				i := e.Values[0].(int)
-				if i > 100 {
+				b := e.Values[0].(string)
+				if len(b) == 5 {
 					return fmt.Errorf("bad %v", e.Values[0])
 				}
 				return nil
 			},
-			input:    []interface{}{123456},
-			expected: []interface{}{123},
+			input:    []any{"zzzzz"},
+			expected: []any{"00000"},
 		},
 		{
-			name: "int8",
+			name: "string_with_letter",
 			fn: func(e CorpusEntry) error {
-				i := e.Values[0].(int8)
-				if i > 10 {
+				b := e.Values[0].(string)
+				r, _ := utf8.DecodeRune([]byte(b))
+				if unicode.IsLetter(r) {
 					return fmt.Errorf("bad %v", e.Values[0])
 				}
 				return nil
 			},
-			input:    []interface{}{int8(1<<7 - 1)},
-			expected: []interface{}{int8(12)},
+			input:    []any{"ZZZZZ"},
+			expected: []any{"A"},
 		},
-		{
-			name: "int16",
-			fn: func(e CorpusEntry) error {
-				i := e.Values[0].(int16)
-				if i > 10 {
-					return fmt.Errorf("bad %v", e.Values[0])
-				}
-				return nil
-			},
-			input:    []interface{}{int16(1<<15 - 1)},
-			expected: []interface{}{int16(32)},
-		},
-		{
-			fn: func(e CorpusEntry) error {
-				i := e.Values[0].(int32)
-				if i > 10 {
-					return fmt.Errorf("bad %v", e.Values[0])
-				}
-				return nil
-			},
-			input:    []interface{}{int32(1<<31 - 1)},
-			expected: []interface{}{int32(21)},
-		},
-		{
-			name: "int32",
-			fn: func(e CorpusEntry) error {
-				i := e.Values[0].(uint)
-				if i > 10 {
-					return fmt.Errorf("bad %v", e.Values[0])
-				}
-				return nil
-			},
-			input:    []interface{}{uint(123456)},
-			expected: []interface{}{uint(12)},
-		},
-		{
-			name: "uint8",
-			fn: func(e CorpusEntry) error {
-				i := e.Values[0].(uint8)
-				if i > 10 {
-					return fmt.Errorf("bad %v", e.Values[0])
-				}
-				return nil
-			},
-			input:    []interface{}{uint8(1<<8 - 1)},
-			expected: []interface{}{uint8(25)},
-		},
-		{
-			name: "uint16",
-			fn: func(e CorpusEntry) error {
-				i := e.Values[0].(uint16)
-				if i > 10 {
-					return fmt.Errorf("bad %v", e.Values[0])
-				}
-				return nil
-			},
-			input:    []interface{}{uint16(1<<16 - 1)},
-			expected: []interface{}{uint16(65)},
-		},
-		{
-			name: "uint32",
-			fn: func(e CorpusEntry) error {
-				i := e.Values[0].(uint32)
-				if i > 10 {
-					return fmt.Errorf("bad %v", e.Values[0])
-				}
-				return nil
-			},
-			input:    []interface{}{uint32(1<<32 - 1)},
-			expected: []interface{}{uint32(42)},
-		},
-		{
-			name: "float32",
-			fn: func(e CorpusEntry) error {
-				if i := e.Values[0].(float32); i == 1.23 {
-					return nil
-				}
-				return fmt.Errorf("bad %v", e.Values[0])
-			},
-			input:    []interface{}{float32(1.23456789)},
-			expected: []interface{}{float32(1.2)},
-		},
-		{
-			name: "float64",
-			fn: func(e CorpusEntry) error {
-				if i := e.Values[0].(float64); i == 1.23 {
-					return nil
-				}
-				return fmt.Errorf("bad %v", e.Values[0])
-			},
-			input:    []interface{}{float64(1.23456789)},
-			expected: []interface{}{float64(1.2)},
-		},
-	}
-
-	// If we are on a 64 bit platform add int64 and uint64 tests
-	if v := int64(1<<63 - 1); int64(int(v)) == v {
-		cases = append(cases, testcase{
-			name: "int64",
-			fn: func(e CorpusEntry) error {
-				i := e.Values[0].(int64)
-				if i > 10 {
-					return fmt.Errorf("bad %v", e.Values[0])
-				}
-				return nil
-			},
-			input:    []interface{}{int64(1<<63 - 1)},
-			expected: []interface{}{int64(92)},
-		}, testcase{
-			name: "uint64",
-			fn: func(e CorpusEntry) error {
-				i := e.Values[0].(uint64)
-				if i > 10 {
-					return fmt.Errorf("bad %v", e.Values[0])
-				}
-				return nil
-			},
-			input:    []interface{}{uint64(1<<64 - 1)},
-			expected: []interface{}{uint64(18)},
-		})
 	}
 
 	for _, tc := range cases {
@@ -241,11 +136,13 @@ func TestMinimizeInput(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ws := &workerServer{
-				fuzzFn: tc.fn,
+				fuzzFn: func(e CorpusEntry) (time.Duration, error) {
+					return time.Second, tc.fn(e)
+				},
 			}
-			count := int64(0)
+			mem := &sharedMem{region: make([]byte, 100)} // big enough to hold value and header
 			vals := tc.input
-			success, err := ws.minimizeInput(context.Background(), vals, &count, 0, nil)
+			success, err := ws.minimizeInput(context.Background(), vals, mem, minimizeArgs{})
 			if !success {
 				t.Errorf("minimizeInput did not succeed")
 			}
@@ -262,25 +159,24 @@ func TestMinimizeInput(t *testing.T) {
 	}
 }
 
-// TestMinimizeInputCoverageError checks that if we're minimizing an interesting
-// input (one that we don't expect to cause an error), and the fuzz function
-// returns an error, minimizing fails, and we return the error quickly.
-func TestMinimizeInputCoverageError(t *testing.T) {
-	errOhNo := errors.New("ohno")
-	ws := &workerServer{fuzzFn: func(e CorpusEntry) error {
-		return errOhNo
+// TestMinimizeFlaky checks that if we're minimizing an interesting
+// input and a flaky failure occurs, that minimization was not indicated
+// to be successful, and the error isn't returned (since it's flaky).
+func TestMinimizeFlaky(t *testing.T) {
+	ws := &workerServer{fuzzFn: func(e CorpusEntry) (time.Duration, error) {
+		return time.Second, errors.New("ohno")
 	}}
-	keepCoverage := make([]byte, len(coverageSnapshot))
-	count := int64(0)
-	vals := []interface{}{[]byte(nil)}
-	success, err := ws.minimizeInput(context.Background(), vals, &count, 0, keepCoverage)
+	mem := &sharedMem{region: make([]byte, 100)} // big enough to hold value and header
+	vals := []any{[]byte(nil)}
+	args := minimizeArgs{KeepCoverage: make([]byte, len(coverageSnapshot))}
+	success, err := ws.minimizeInput(context.Background(), vals, mem, args)
 	if success {
 		t.Error("unexpected success")
 	}
-	if err != errOhNo {
+	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	if count != 1 {
+	if count := mem.header().count; count != 1 {
 		t.Errorf("count: got %d, want 1", count)
 	}
 }
