@@ -301,7 +301,7 @@ func InitWorkfile() {
 	}
 }
 
-// WorkFilePath returns the path of the go.work file, or "" if not in
+// WorkFilePath returns the absolute path of the go.work file, or "" if not in
 // workspace mode. WorkFilePath must be called after InitWorkfile.
 func WorkFilePath() string {
 	return workFilePath
@@ -610,6 +610,9 @@ func UpdateWorkFile(wf *modfile.WorkFile) {
 	missingModulePaths := map[string]string{} // module directory listed in file -> abspath modroot
 
 	for _, d := range wf.Use {
+		if d.Path == "" {
+			continue // d is marked for deletion.
+		}
 		modRoot := d.Path
 		if d.ModulePath == "" {
 			missingModulePaths[d.Path] = modRoot
