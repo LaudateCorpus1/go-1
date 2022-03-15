@@ -1186,6 +1186,13 @@ func (ctxt *Context) importGo(p *Package, path, srcDir string, mode ImportMode) 
 		"GOPATH="+ctxt.GOPATH,
 		"CGO_ENABLED="+cgo,
 	)
+	if cmd.Dir != "" {
+		// If possible, set PWD: if an error occurs and PWD includes a symlink, we
+		// want the error to refer to Dir, not some other name for it.
+		if abs, err := filepath.Abs(cmd.Dir); err == nil {
+			cmd.Env = append(cmd.Env, "PWD="+abs)
+		}
+	}
 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("go/build: go list %s: %v\n%s\n", path, err, stderr.String())
@@ -1963,18 +1970,6 @@ func (ctxt *Context) goodOSArchFile(name string, allTags map[string]bool) bool {
 		return ctxt.matchTag(l[n-1], allTags)
 	}
 	return true
-}
-
-var knownOS = make(map[string]bool)
-var knownArch = make(map[string]bool)
-
-func init() {
-	for _, v := range strings.Fields(goosList) {
-		knownOS[v] = true
-	}
-	for _, v := range strings.Fields(goarchList) {
-		knownArch[v] = true
-	}
 }
 
 // ToolDir is the directory containing build tools.

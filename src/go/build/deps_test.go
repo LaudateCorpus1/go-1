@@ -88,6 +88,7 @@ var depsRules = `
 	< internal/itoa
 	< internal/unsafeheader
 	< runtime/internal/sys
+	< runtime/internal/syscall
 	< runtime/internal/atomic
 	< runtime/internal/math
 	< runtime
@@ -211,8 +212,7 @@ var depsRules = `
 
 	# Misc packages needing only FMT.
 	FMT
-	< flag,
-	  html,
+	< html,
 	  mime/quotedprintable,
 	  net/internal/socktest,
 	  net/url,
@@ -228,6 +228,8 @@ var depsRules = `
 	encoding, reflect
 	< encoding/binary
 	< encoding/base32, encoding/base64;
+
+	FMT, encoding < flag;
 
 	fmt !< encoding/base32, encoding/base64;
 
@@ -309,6 +311,7 @@ var depsRules = `
 	< go/build;
 
 	DEBUG, go/build, go/types, text/scanner
+  < internal/pkgbits
 	< go/internal/gcimporter, go/internal/gccgoimporter, go/internal/srcimporter
 	< go/importer;
 

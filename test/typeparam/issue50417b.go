@@ -1,4 +1,4 @@
-// run -gcflags=-G=3
+// run
 
 // Copyright 2022 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -6,6 +6,13 @@
 
 package main
 
+func main() {}
+
+// Field accesses through type parameters are disabled
+// until we have a more thorough understanding of the
+// implications on the spec. See issue #51576.
+
+/*
 import "fmt"
 
 type MyStruct struct {
@@ -48,3 +55,4 @@ func main() {
 		panic(fmt.Sprintf("got %d, want %d", got, want))
 	}
 }
+*/

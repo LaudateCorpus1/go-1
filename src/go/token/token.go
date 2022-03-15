@@ -286,7 +286,7 @@ func (op Token) Precedence() int {
 var keywords map[string]Token
 
 func init() {
-	keywords = make(map[string]Token)
+	keywords = make(map[string]Token, keyword_end-(keyword_beg+1))
 	for i := keyword_beg + 1; i < keyword_end; i++ {
 		keywords[tokens[i]] = i
 	}
@@ -340,10 +340,13 @@ func IsKeyword(name string) bool {
 // is not a digit. Keywords are not identifiers.
 //
 func IsIdentifier(name string) bool {
+	if name == "" || IsKeyword(name) {
+		return false
+	}
 	for i, c := range name {
 		if !unicode.IsLetter(c) && c != '_' && (i == 0 || !unicode.IsDigit(c)) {
 			return false
 		}
 	}
-	return name != "" && !IsKeyword(name)
+	return true
 }

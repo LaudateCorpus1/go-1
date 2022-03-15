@@ -47,7 +47,6 @@ import (
 //go:cgo_import_dynamic libc_sysconf sysconf "libc.so"
 //go:cgo_import_dynamic libc_usleep usleep "libc.so"
 //go:cgo_import_dynamic libc_write write "libc.so"
-//go:cgo_import_dynamic libc_pipe pipe "libc.so"
 //go:cgo_import_dynamic libc_pipe2 pipe2 "libc.so"
 
 //go:linkname libc____errno libc____errno
@@ -83,7 +82,6 @@ import (
 //go:linkname libc_sysconf libc_sysconf
 //go:linkname libc_usleep libc_usleep
 //go:linkname libc_write libc_write
-//go:linkname libc_pipe libc_pipe
 //go:linkname libc_pipe2 libc_pipe2
 
 var (
@@ -120,7 +118,6 @@ var (
 	libc_sysconf,
 	libc_usleep,
 	libc_write,
-	libc_pipe,
 	libc_pipe2 libcFunc
 )
 
@@ -562,13 +559,6 @@ func write1(fd uintptr, buf unsafe.Pointer, nbyte int32) int32 {
 }
 
 //go:nosplit
-func pipe() (r, w int32, errno int32) {
-	var p [2]int32
-	_, e := sysvicall1Err(&libc_pipe, uintptr(noescape(unsafe.Pointer(&p))))
-	return p[0], p[1], int32(e)
-}
-
-//go:nosplit
 func pipe2(flags int32) (r, w int32, errno int32) {
 	var p [2]int32
 	_, e := sysvicall2Err(&libc_pipe2, uintptr(noescape(unsafe.Pointer(&p))), uintptr(flags))
@@ -578,12 +568,6 @@ func pipe2(flags int32) (r, w int32, errno int32) {
 //go:nosplit
 func closeonexec(fd int32) {
 	fcntl(fd, _F_SETFD, _FD_CLOEXEC)
-}
-
-//go:nosplit
-func setNonblock(fd int32) {
-	flags := fcntl(fd, _F_GETFL, 0)
-	fcntl(fd, _F_SETFL, flags|_O_NONBLOCK)
 }
 
 func osyield1()
@@ -633,4 +617,13 @@ func sysauxv(auxv []uintptr) {
 			executablePath = gostringnocopy((*byte)(unsafe.Pointer(val)))
 		}
 	}
+}
+
+// sigPerThreadSyscall is only used on linux, so we assign a bogus signal
+// number.
+const sigPerThreadSyscall = 1 << 31
+
+//go:nosplit
+func runPerThreadSyscall() {
+	throw("runPerThreadSyscall only valid on linux")
 }
