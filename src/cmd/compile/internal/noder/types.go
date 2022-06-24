@@ -166,7 +166,7 @@ func (g *irgen) typ0(typ types2.Type) *types.Type {
 			//fmt.Printf("Saw new type %v %v\n", instName, ntyp.HasTParam())
 
 			// Save the symbol for the base generic type.
-			ntyp.SetOrigSym(g.pkg(typ.Obj().Pkg()).Lookup(typ.Obj().Name()))
+			ntyp.SetOrigType(base.Type())
 			ntyp.SetUnderlying(g.typ1(typ.Underlying()))
 			if typ.NumMethods() != 0 {
 				// Save a delayed call to g.fillinMethods() (once
@@ -253,11 +253,10 @@ func (g *irgen) typ0(typ types2.Type) *types.Type {
 			// this types2-to-types1 translation.
 			return sym.Def.Type()
 		}
-		tp := types.NewTypeParam(sym, typ.Index())
-		nname := ir.NewDeclNameAt(g.pos(typ.Obj().Pos()), ir.OTYPE, sym)
-		sym.Def = nname
-		nname.SetType(tp)
-		tp.SetNod(nname)
+		obj := ir.NewDeclNameAt(g.pos(typ.Obj().Pos()), ir.OTYPE, sym)
+		sym.Def = obj
+		tp := types.NewTypeParam(obj, typ.Index())
+		obj.SetType(tp)
 		// Set g.typs[typ] in case the bound methods reference typ.
 		g.typs[typ] = tp
 

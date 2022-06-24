@@ -58,10 +58,6 @@ func tcShift(n, l, r ir.Node) (ir.Node, ir.Node, *types.Type) {
 		base.Errorf("invalid operation: %v (shift count type %v, must be integer)", n, r.Type())
 		return l, r, nil
 	}
-	if t.IsSigned() && !types.AllowsGoVersion(curpkg(), 1, 13) {
-		base.ErrorfVers("go1.13", "invalid operation: %v (signed shift count type %v)", n, r.Type())
-		return l, r, nil
-	}
 	t = l.Type()
 	if t != nil && t.Kind() != types.TIDEAL && !t.IsInteger() {
 		base.Errorf("invalid operation: %v (shift of type %v)", n, t)
@@ -80,8 +76,9 @@ func tcShift(n, l, r ir.Node) (ir.Node, ir.Node, *types.Type) {
 // tcArith typechecks operands of a binary arithmetic expression.
 // The result of tcArith MUST be assigned back to original operands,
 // t is the type of the expression, and should be set by the caller. e.g:
-//     n.X, n.Y, t = tcArith(n, op, n.X, n.Y)
-//     n.SetType(t)
+//
+//	n.X, n.Y, t = tcArith(n, op, n.X, n.Y)
+//	n.SetType(t)
 func tcArith(n ir.Node, op ir.Op, l, r ir.Node) (ir.Node, ir.Node, *types.Type) {
 	l, r = defaultlit2(l, r, false)
 	if l.Type() == nil || r.Type() == nil {
@@ -198,7 +195,8 @@ func tcArith(n ir.Node, op ir.Op, l, r ir.Node) (ir.Node, ir.Node, *types.Type) 
 }
 
 // The result of tcCompLit MUST be assigned back to n, e.g.
-// 	n.Left = tcCompLit(n.Left)
+//
+//	n.Left = tcCompLit(n.Left)
 func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 	if base.EnableTrace && base.Flag.LowerT {
 		defer tracePrint("tcCompLit", n)(&res)
@@ -209,24 +207,13 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 		base.Pos = lno
 	}()
 
-	if n.Ntype == nil {
-		base.ErrorfAt(n.Pos(), "missing type in composite literal")
-		n.SetType(nil)
-		return n
-	}
-
 	// Save original node (including n.Right)
 	n.SetOrig(ir.Copy(n))
 
-	ir.SetPos(n.Ntype)
+	ir.SetPos(n)
 
-	n.Ntype = typecheckNtype(n.Ntype)
-	t := n.Ntype.Type()
-	if t == nil {
-		n.SetType(nil)
-		return n
-	}
-	n.SetType(t)
+	t := n.Type()
+	base.AssertfAt(t != nil, n.Pos(), "missing type in composite literal")
 
 	switch t.Kind() {
 	default:
@@ -236,12 +223,10 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 	case types.TARRAY:
 		typecheckarraylit(t.Elem(), t.NumElem(), n.List, "array literal")
 		n.SetOp(ir.OARRAYLIT)
-		n.Ntype = nil
 
 	case types.TSLICE:
 		length := typecheckarraylit(t.Elem(), -1, n.List, "slice literal")
 		n.SetOp(ir.OSLICELIT)
-		n.Ntype = nil
 		n.Len = length
 
 	case types.TMAP:
@@ -255,18 +240,15 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 			l := l.(*ir.KeyExpr)
 
 			r := l.Key
-			r = pushtype(r, t.Key())
 			r = Expr(r)
 			l.Key = AssignConv(r, t.Key(), "map key")
 
 			r = l.Value
-			r = pushtype(r, t.Elem())
 			r = Expr(r)
 			l.Value = AssignConv(r, t.Elem(), "map value")
 		}
 
 		n.SetOp(ir.OMAPLIT)
-		n.Ntype = nil
 
 	case types.TSTRUCT:
 		// Need valid field offsets for Xoffset below.
@@ -347,7 +329,6 @@ func tcCompLit(n *ir.CompLitExpr) (res ir.Node) {
 		}
 
 		n.SetOp(ir.OSTRUCTLIT)
-		n.Ntype = nil
 	}
 
 	return n
@@ -413,13 +394,7 @@ func tcConv(n *ir.ConvExpr) ir.Node {
 	}
 	op, why := Convertop(n.X.Op() == ir.OLITERAL, t, n.Type())
 	if op == ir.OXXX {
-		if !n.Diag() && !n.Type().Broke() && !n.X.Diag() {
-			base.Errorf("cannot convert %L to type %v%s", n.X, n.Type(), why)
-			n.SetDiag(true)
-		}
-		n.SetOp(ir.OCONV)
-		n.SetType(nil)
-		return n
+		base.Fatalf("cannot convert %L to type %v%s", n.X, n.Type(), why)
 	}
 
 	n.SetOp(op)
@@ -557,14 +532,7 @@ func tcDotType(n *ir.TypeAssertExpr) ir.Node {
 		return n
 	}
 
-	if n.Ntype != nil {
-		n.Ntype = typecheckNtype(n.Ntype)
-		n.SetType(n.Ntype.Type())
-		n.Ntype = nil
-		if n.Type() == nil {
-			return n
-		}
-	}
+	base.AssertfAt(n.Type() != nil, n.Pos(), "missing type: %v", n)
 
 	if n.Type() != nil && !n.Type().IsInterface() {
 		var missing, have *types.Field
@@ -853,11 +821,11 @@ func tcStar(n *ir.StarExpr, top int) ir.Node {
 		n.SetType(nil)
 		return n
 	}
+
+	// TODO(mdempsky): Remove (along with ctxType above) once I'm
+	// confident this code path isn't needed any more.
 	if l.Op() == ir.OTYPE {
-		n.SetOTYPE(types.NewPtr(l.Type()))
-		// Ensure l.Type gets CalcSize'd for the backend. Issue 20174.
-		types.CheckSize(l.Type())
-		return n
+		base.Fatalf("unexpected type in deref expression: %v", l)
 	}
 
 	if !t.IsPtr() {

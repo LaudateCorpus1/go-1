@@ -16,7 +16,6 @@ import (
 	"sort"
 
 	"cmd/compile/internal/base"
-	"cmd/compile/internal/importer"
 	"cmd/compile/internal/inline"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/typecheck"
@@ -30,60 +29,49 @@ import (
 // later.
 var localPkgReader *pkgReader
 
-// unified construct the local package's IR from syntax's AST.
+// unified constructs the local package's Internal Representation (IR)
+// from its syntax tree (AST).
 //
 // The pipeline contains 2 steps:
 //
-// (1) Generate package export data "stub".
+//  1. Generate the export data "stub".
 //
-// (2) Generate package IR from package export data.
+//  2. Generate the IR from the export data above.
 //
 // The package data "stub" at step (1) contains everything from the local package,
-// but nothing that have been imported. When we're actually writing out export data
-// to the output files (see writeNewExport function), we run the "linker", which does
-// a few things:
+// but nothing that has been imported. When we're actually writing out export data
+// to the output files (see writeNewExport), we run the "linker", which:
 //
-// + Updates compiler extensions data (e.g., inlining cost, escape analysis results).
+//   - Updates compiler extensions data (e.g. inlining cost, escape analysis results).
 //
-// + Handles re-exporting any transitive dependencies.
+//   - Handles re-exporting any transitive dependencies.
 //
-// + Prunes out any unnecessary details (e.g., non-inlineable functions, because any
-//   downstream importers only care about inlinable functions).
+//   - Prunes out any unnecessary details (e.g. non-inlineable functions, because any
+//     downstream importers only care about inlinable functions).
 //
-// The source files are typechecked twice, once before writing export data
-// using types2 checker, once after read export data using gc/typecheck.
-// This duplication of work will go away once we always use types2 checker,
-// we can remove the gc/typecheck pass. The reason it is still here:
+// The source files are typechecked twice: once before writing the export data
+// using types2, and again after reading the export data using gc/typecheck.
+// The duplication of work will go away once we only use the types2 type checker,
+// removing the gc/typecheck step. For now, it is kept because:
 //
-// + It reduces engineering costs in maintaining a fork of typecheck
-//   (e.g., no need to backport fixes like CL 327651).
+//   - It reduces the engineering costs in maintaining a fork of typecheck
+//     (e.g. no need to backport fixes like CL 327651).
 //
-// + It makes it easier to pass toolstash -cmp.
+//   - It makes it easier to pass toolstash -cmp.
 //
-// + Historically, we would always re-run the typechecker after import, even though
-//   we know the imported data is valid. It's not ideal, but also not causing any
-//   problem either.
+//   - Historically, we would always re-run the typechecker after importing a package,
+//     even though we know the imported data is valid. It's not ideal, but it's
+//     not causing any problems either.
 //
-// + There's still transformation that being done during gc/typecheck, like rewriting
-//   multi-valued function call, or transform ir.OINDEX -> ir.OINDEXMAP.
+//   - gc/typecheck is still in charge of some transformations, such as rewriting
+//     multi-valued function calls or transforming ir.OINDEX to ir.OINDEXMAP.
 //
-// Using syntax+types2 tree, which already has a complete representation of generics,
-// the unified IR has the full typed AST for doing introspection during step (1).
-// In other words, we have all necessary information to build the generic IR form
+// Using the syntax tree with types2, which has a complete representation of generics,
+// the unified IR has the full typed AST needed for introspection during step (1).
+// In other words, we have all the necessary information to build the generic IR form
 // (see writer.captureVars for an example).
 func unified(noders []*noder) {
 	inline.NewInline = InlineCall
-
-	writeNewExportFunc = writeNewExport
-
-	newReadImportFunc = func(data string, pkg1 *types.Pkg, ctxt *types2.Context, packages map[string]*types2.Package) (pkg2 *types2.Package, err error) {
-		pr := pkgbits.NewPkgDecoder(pkg1.Path, data)
-
-		// Read package descriptors for both types2 and compiler backend.
-		readPackage(newPkgReader(pr), pkg1)
-		pkg2 = importer.ReadPackage(ctxt, packages, pr)
-		return
-	}
 
 	data := writePkgStub(noders)
 
@@ -94,7 +82,6 @@ func unified(noders []*noder) {
 	base.Flag.Lang = fmt.Sprintf("go1.%d", goversion.Version)
 	types.ParseLangFlag()
 
-	assert(types.LocalPkg.Path == "")
 	types.LocalPkg.Height = 0 // reset so pkgReader.pkgIdx doesn't complain
 	target := typecheck.Target
 
@@ -244,7 +231,7 @@ func readPackage(pr *pkgReader, importpkg *types.Pkg) {
 	r := pr.newReader(pkgbits.RelocMeta, pkgbits.PublicRootIdx, pkgbits.SyncPublic)
 
 	pkg := r.pkg()
-	assert(pkg == importpkg)
+	base.Assertf(pkg == importpkg, "have package %q (%p), want package %q (%p)", pkg.Path, pkg, importpkg.Path, importpkg)
 
 	if r.Bool() {
 		sym := pkg.Lookup(".inittask")
@@ -266,18 +253,18 @@ func readPackage(pr *pkgReader, importpkg *types.Pkg) {
 	}
 }
 
-func writeNewExport(out io.Writer) {
+func writeUnifiedExport(out io.Writer) {
 	l := linker{
 		pw: pkgbits.NewPkgEncoder(base.Debug.SyncFrames),
 
-		pkgs:  make(map[string]int),
-		decls: make(map[*types.Sym]int),
+		pkgs:  make(map[string]pkgbits.Index),
+		decls: make(map[*types.Sym]pkgbits.Index),
 	}
 
 	publicRootWriter := l.pw.NewEncoder(pkgbits.RelocMeta, pkgbits.SyncPublic)
 	assert(publicRootWriter.Idx == pkgbits.PublicRootIdx)
 
-	var selfPkgIdx int
+	var selfPkgIdx pkgbits.Index
 
 	{
 		pr := localPkgReader
@@ -307,11 +294,11 @@ func writeNewExport(out io.Writer) {
 	}
 
 	{
-		var idxs []int
+		var idxs []pkgbits.Index
 		for _, idx := range l.decls {
 			idxs = append(idxs, idx)
 		}
-		sort.Ints(idxs)
+		sort.Slice(idxs, func(i, j int) bool { return idxs[i] < idxs[j] })
 
 		w := publicRootWriter
 
@@ -332,5 +319,5 @@ func writeNewExport(out io.Writer) {
 		w.Flush()
 	}
 
-	l.pw.DumpTo(out)
+	base.Ctxt.Fingerprint = l.pw.DumpTo(out)
 }

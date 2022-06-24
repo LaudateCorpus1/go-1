@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+//go:build !js
 
 // DNS client: see RFC 1035.
 // Has to be linked into package net for Dial.
@@ -20,6 +20,7 @@ import (
 	"internal/itoa"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -74,11 +75,14 @@ func newRequest(q dnsmessage.Question) (id uint16, udpReq, tcpReq []byte, err er
 	}
 
 	tcpReq, err = b.Finish()
+	if err != nil {
+		return 0, nil, nil, err
+	}
 	udpReq = tcpReq[2:]
 	l := len(tcpReq) - 2
 	tcpReq[0] = byte(l >> 8)
 	tcpReq[1] = byte(l)
-	return id, udpReq, tcpReq, err
+	return id, udpReq, tcpReq, nil
 }
 
 func checkResponse(reqID uint16, reqQues dnsmessage.Question, respHdr dnsmessage.Header, respQues dnsmessage.Question) bool {
@@ -378,12 +382,21 @@ func (conf *resolverConfig) tryUpdate(name string) {
 	}
 	conf.lastChecked = now
 
-	var mtime time.Time
-	if fi, err := os.Stat(name); err == nil {
-		mtime = fi.ModTime()
-	}
-	if mtime.Equal(conf.dnsConfig.mtime) {
-		return
+	switch runtime.GOOS {
+	case "windows":
+		// There's no file on disk, so don't bother checking
+		// and failing.
+		//
+		// The Windows implementation of dnsReadConfig (called
+		// below) ignores the name.
+	default:
+		var mtime time.Time
+		if fi, err := os.Stat(name); err == nil {
+			mtime = fi.ModTime()
+		}
+		if mtime.Equal(conf.dnsConfig.mtime) {
+			return
+		}
 	}
 
 	dnsConf := dnsReadConfig(name)

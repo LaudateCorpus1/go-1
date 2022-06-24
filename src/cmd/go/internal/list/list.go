@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package list implements the ``go list'' command.
+// Package list implements the “go list” command.
 package list
 
 import (
@@ -187,7 +187,8 @@ a non-nil Error field; other information may or may not be missing
 (zeroed).
 
 The -export flag causes list to set the Export field to the name of a
-file containing up-to-date export information for the given package.
+file containing up-to-date export information for the given package,
+and the BuildID field to the build ID of the compiled package.
 
 The -find flag causes list to identify the named packages but not
 resolve their dependencies: the Imports and Deps lists will be empty.
@@ -567,6 +568,15 @@ func runList(ctx context.Context, cmd *base.Command, args []string) {
 	pkgOpts := load.PackageOpts{
 		IgnoreImports:   *listFind,
 		ModResolveTests: *listTest,
+		LoadVCS:         true,
+		// SuppressDeps is set if the user opts to explicitly ask for the json fields they
+		// need, don't ask for Deps or DepsErrors. It's not set when using a template string,
+		// even if *listFmt doesn't contain .Deps because Deps are used to find import cycles
+		// for test variants of packages and users who have been providing format strings
+		// might not expect those errors to stop showing up.
+		// See issue #52443.
+		SuppressDeps:      !listJsonFields.needAny("Deps", "DepsErrors"),
+		SuppressBuildInfo: !listJsonFields.needAny("Stale", "StaleReason"),
 	}
 	pkgs := load.PackagesAndErrors(ctx, pkgOpts, args)
 	if !*listE {

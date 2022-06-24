@@ -502,13 +502,13 @@ func (check *Checker) typeDecl(obj *TypeName, tdecl *syntax.TypeDecl, def *Named
 		}
 
 		check.brokenAlias(obj)
-		rhs = check.varType(tdecl.Type)
+		rhs = check.typ(tdecl.Type)
 		check.validAlias(obj, rhs)
 		return
 	}
 
 	// type definition or generic type declaration
-	named := check.newNamed(obj, nil, nil, nil, nil)
+	named := check.newNamed(obj, nil, nil)
 	def.setUnderlying(named)
 
 	if tdecl.TParamList != nil {
@@ -522,8 +522,8 @@ func (check *Checker) typeDecl(obj *TypeName, tdecl *syntax.TypeDecl, def *Named
 	assert(rhs != nil)
 	named.fromRHS = rhs
 
-	// If the underlying was not set while type-checking the right-hand side, it
-	// is invalid and an error should have been reported elsewhere.
+	// If the underlying type was not set while type-checking the right-hand
+	// side, it is invalid and an error should have been reported elsewhere.
 	if named.underlying == nil {
 		named.underlying = Typ[Invalid]
 	}
@@ -635,21 +635,19 @@ func (check *Checker) collectMethods(obj *TypeName) {
 	// and field names must be distinct."
 	base, _ := obj.typ.(*Named) // shouldn't fail but be conservative
 	if base != nil {
-		assert(base.targs.Len() == 0) // collectMethods should not be called on an instantiated type
-		u := base.under()
-		if t, _ := u.(*Struct); t != nil {
-			for _, fld := range t.fields {
-				if fld.name != "_" {
-					assert(mset.insert(fld) == nil)
-				}
-			}
-		}
+		assert(base.TypeArgs().Len() == 0) // collectMethods should not be called on an instantiated type
+
+		// See issue #52529: we must delay the expansion of underlying here, as
+		// base may not be fully set-up.
+		check.later(func() {
+			check.checkFieldUniqueness(base)
+		}).describef(obj, "verifying field uniqueness for %v", base)
 
 		// Checker.Files may be called multiple times; additional package files
 		// may add methods to already type-checked types. Add pre-existing methods
 		// so that we can detect redeclarations.
-		for i := 0; i < base.methods.Len(); i++ {
-			m := base.methods.At(i, nil)
+		for i := 0; i < base.NumMethods(); i++ {
+			m := base.Method(i)
 			assert(m.name != "_")
 			assert(mset.insert(m) == nil)
 		}
@@ -662,17 +660,10 @@ func (check *Checker) collectMethods(obj *TypeName) {
 		assert(m.name != "_")
 		if alt := mset.insert(m); alt != nil {
 			var err error_
-			switch alt.(type) {
-			case *Var:
-				err.errorf(m.pos, "field and method with the same name %s", m.name)
-			case *Func:
-				if check.conf.CompilerErrorMessages {
-					err.errorf(m.pos, "%s.%s redeclared in this block", obj.Name(), m.name)
-				} else {
-					err.errorf(m.pos, "method %s already declared for %s", m.name, obj)
-				}
-			default:
-				unreachable()
+			if check.conf.CompilerErrorMessages {
+				err.errorf(m.pos, "%s.%s redeclared in this block", obj.Name(), m.name)
+			} else {
+				err.errorf(m.pos, "method %s already declared for %s", m.name, obj)
 			}
 			err.recordAltDecl(alt)
 			check.report(&err)
@@ -680,8 +671,37 @@ func (check *Checker) collectMethods(obj *TypeName) {
 		}
 
 		if base != nil {
-			base.resolve(nil) // TODO(mdempsky): Probably unnecessary.
 			base.AddMethod(m)
+		}
+	}
+}
+
+func (check *Checker) checkFieldUniqueness(base *Named) {
+	if t, _ := base.under().(*Struct); t != nil {
+		var mset objset
+		for i := 0; i < base.NumMethods(); i++ {
+			m := base.Method(i)
+			assert(m.name != "_")
+			assert(mset.insert(m) == nil)
+		}
+
+		// Check that any non-blank field names of base are distinct from its
+		// method names.
+		for _, fld := range t.fields {
+			if fld.name != "_" {
+				if alt := mset.insert(fld); alt != nil {
+					// Struct fields should already be unique, so we should only
+					// encounter an alternate via collision with a method name.
+					_ = alt.(*Func)
+
+					// For historical consistency, we report the primary error on the
+					// method, and the alt decl on the field.
+					var err error_
+					err.errorf(alt, "field and method with the same name %s", fld.name)
+					err.recordAltDecl(fld)
+					check.report(&err)
+				}
+			}
 		}
 	}
 }
@@ -716,7 +736,7 @@ func (check *Checker) funcDecl(obj *Func, decl *declInfo) {
 	if !check.conf.IgnoreFuncBodies && fdecl.Body != nil {
 		check.later(func() {
 			check.funcBody(decl, obj.name, sig, fdecl.Body, nil)
-		})
+		}).describef(obj, "func %s", obj.name)
 	}
 }
 
@@ -735,7 +755,7 @@ func (check *Checker) declStmt(list []syntax.Decl) {
 			top := len(check.delayed)
 
 			// iota is the index of the current constDecl within the group
-			if first < 0 || list[index-1].(*syntax.ConstDecl).Group != s.Group {
+			if first < 0 || s.Group == nil || list[index-1].(*syntax.ConstDecl).Group != s.Group {
 				first = index
 				last = nil
 			}

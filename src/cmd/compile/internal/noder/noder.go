@@ -27,35 +27,41 @@ import (
 func LoadPackage(filenames []string) {
 	base.Timer.Start("fe", "parse")
 
-	mode := syntax.CheckBranches | syntax.AllowGenerics
+	mode := syntax.CheckBranches
 
 	// Limit the number of simultaneously open files.
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0)+10)
 
 	noders := make([]*noder, len(filenames))
-	for i, filename := range filenames {
+	for i := range noders {
 		p := noder{
 			err: make(chan syntax.Error),
 		}
 		noders[i] = &p
-
-		filename := filename
-		go func() {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			defer close(p.err)
-			fbase := syntax.NewFileBase(filename)
-
-			f, err := os.Open(filename)
-			if err != nil {
-				p.error(syntax.Error{Msg: err.Error()})
-				return
-			}
-			defer f.Close()
-
-			p.file, _ = syntax.Parse(fbase, f, p.error, p.pragma, mode) // errors are tracked via p.error
-		}()
 	}
+
+	// Move the entire syntax processing logic into a separate goroutine to avoid blocking on the "sem".
+	go func() {
+		for i, filename := range filenames {
+			filename := filename
+			p := noders[i]
+			sem <- struct{}{}
+			go func() {
+				defer func() { <-sem }()
+				defer close(p.err)
+				fbase := syntax.NewFileBase(filename)
+
+				f, err := os.Open(filename)
+				if err != nil {
+					p.error(syntax.Error{Msg: err.Error()})
+					return
+				}
+				defer f.Close()
+
+				p.file, _ = syntax.Parse(fbase, f, p.error, p.pragma, mode) // errors are tracked via p.error
+			}()
+		}
+	}()
 
 	var lines uint
 	for _, p := range noders {
@@ -334,6 +340,9 @@ func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.P
 		if !base.Flag.CompilingRuntime && flag&runtimePragmas != 0 {
 			p.error(syntax.Error{Pos: pos, Msg: fmt.Sprintf("//%s only allowed in runtime", verb)})
 		}
+		if flag == ir.UintptrKeepAlive && !base.Flag.Std {
+			p.error(syntax.Error{Pos: pos, Msg: fmt.Sprintf("//%s is only allowed in the standard library", verb)})
+		}
 		if flag == 0 && !allowedStdPragmas[verb] && base.Flag.Std {
 			p.error(syntax.Error{Pos: pos, Msg: fmt.Sprintf("//%s is not allowed in the standard library", verb)})
 		}
@@ -433,7 +442,7 @@ func parseGoEmbed(args string) ([]string, error) {
 // the name, normally "pkg.init", is altered to "pkg.init.0".
 var renameinitgen int
 
-func renameinit() *types.Sym {
+func Renameinit() *types.Sym {
 	s := typecheck.LookupNum("init.", renameinitgen)
 	renameinitgen++
 	return s
@@ -472,7 +481,7 @@ func checkEmbed(decl *syntax.VarDecl, haveEmbed, withinFunc bool) error {
 		return errors.New("go:embed cannot apply to var without type")
 	case withinFunc:
 		return errors.New("go:embed cannot apply to var inside func")
-	case !types.AllowsGoVersion(types.LocalPkg, 1, 16):
+	case !types.AllowsGoVersion(1, 16):
 		return fmt.Errorf("go:embed requires go1.16 or later (-lang was set to %s; check go.mod)", base.Flag.Lang)
 
 	default:

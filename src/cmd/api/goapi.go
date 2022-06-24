@@ -16,10 +16,10 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
-	exec "internal/execabs"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -34,9 +34,11 @@ func goCmd() string {
 	if runtime.GOOS == "windows" {
 		exeSuffix = ".exe"
 	}
-	path := filepath.Join(runtime.GOROOT(), "bin", "go"+exeSuffix)
-	if _, err := os.Stat(path); err == nil {
-		return path
+	if goroot := build.Default.GOROOT; goroot != "" {
+		path := filepath.Join(goroot, "bin", "go"+exeSuffix)
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
 	}
 	return "go"
 }
@@ -126,6 +128,10 @@ var internalPkg = regexp.MustCompile(`(^|/)internal($|/)`)
 
 func main() {
 	flag.Parse()
+
+	if build.Default.GOROOT == "" {
+		log.Fatalf("GOROOT not found. (If binary was built with -trimpath, $GOROOT must be set.)")
+	}
 
 	if !strings.Contains(runtime.Version(), "weekly") && !strings.Contains(runtime.Version(), "devel") {
 		if *nextFiles != "" {

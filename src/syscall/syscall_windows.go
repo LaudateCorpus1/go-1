@@ -8,6 +8,7 @@ package syscall
 
 import (
 	errorspkg "errors"
+	"internal/bytealg"
 	"internal/itoa"
 	"internal/oserror"
 	"internal/race"
@@ -39,10 +40,8 @@ func StringToUTF16(s string) []uint16 {
 // s, with a terminating NUL added. If s contains a NUL byte at any
 // location, it returns (nil, EINVAL).
 func UTF16FromString(s string) ([]uint16, error) {
-	for i := 0; i < len(s); i++ {
-		if s[i] == 0 {
-			return nil, EINVAL
-		}
+	if bytealg.IndexByteString(s, 0) != -1 {
+		return nil, EINVAL
 	}
 	return utf16.Encode([]rune(s + "\x00")), nil
 }
@@ -449,12 +448,11 @@ func setFilePointerEx(handle Handle, distToMove int64, newFilePointer *int64, wh
 		default:
 			panic("unsupported 32-bit architecture")
 		case "386":
-			// distToMove is a LARGE_INTEGER:
-			// https://msdn.microsoft.com/en-us/library/windows/desktop/aa383713(v=vs.85).aspx
+			// distToMove is a LARGE_INTEGER, which is 64 bits.
 			_, _, e1 = Syscall6(procSetFilePointerEx.Addr(), 5, uintptr(handle), uintptr(distToMove), uintptr(distToMove>>32), uintptr(unsafe.Pointer(newFilePointer)), uintptr(whence), 0)
 		case "arm":
 			// distToMove must be 8-byte aligned per ARM calling convention
-			// https://msdn.microsoft.com/en-us/library/dn736986.aspx#Anchor_7
+			// https://docs.microsoft.com/en-us/cpp/build/overview-of-arm-abi-conventions#stage-c-assignment-of-arguments-to-registers-and-stack
 			_, _, e1 = Syscall6(procSetFilePointerEx.Addr(), 6, uintptr(handle), 0, uintptr(distToMove), uintptr(distToMove>>32), uintptr(unsafe.Pointer(newFilePointer)), uintptr(whence))
 		}
 	}

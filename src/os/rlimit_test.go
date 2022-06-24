@@ -6,6 +6,7 @@ package os_test
 
 import (
 	. "os"
+	"runtime"
 	"testing"
 )
 
@@ -16,8 +17,15 @@ func TestOpenFileLimit(t *testing.T) {
 	// with hard limits of 4096 and 524288, respectively.
 	// Check that we can open 1200 files, which proves
 	// that the rlimit is being raised appropriately on those systems.
+	fileCount := 1200
+
+	// OpenBSD has a default soft limit of 512 and hard limit of 1024.
+	if runtime.GOOS == "openbsd" {
+		fileCount = 768
+	}
+
 	var files []*File
-	for i := 0; i < 1200; i++ {
+	for i := 0; i < fileCount; i++ {
 		f, err := Open("rlimit.go")
 		if err != nil {
 			t.Error(err)

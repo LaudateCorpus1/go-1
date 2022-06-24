@@ -78,7 +78,7 @@ func typecheckrangeExpr(n *ir.RangeStmt) {
 					base.ErrorfAt(n.Pos(), "cannot assign type %v to %L in range%s", t, nn, why)
 				}
 			}
-			checkassign(n, nn)
+			checkassign(nn)
 		}
 	}
 	do(n.Key, tk)
@@ -127,17 +127,14 @@ func assign(stmt ir.Node, lhs, rhs []ir.Node) {
 
 	checkLHS := func(i int, typ *types.Type) {
 		lhs[i] = Resolve(lhs[i])
-		if n := lhs[i]; typ != nil && ir.DeclaredBy(n, stmt) && n.Name().Ntype == nil {
-			if typ.Kind() != types.TNIL {
-				n.SetType(defaultType(typ))
-			} else {
-				base.Errorf("use of untyped nil")
-			}
+		if n := lhs[i]; typ != nil && ir.DeclaredBy(n, stmt) && n.Type() == nil {
+			base.Assertf(typ.Kind() == types.TNIL, "unexpected untyped nil")
+			n.SetType(defaultType(typ))
 		}
 		if lhs[i].Typecheck() == 0 {
 			lhs[i] = AssignExpr(lhs[i])
 		}
-		checkassign(stmt, lhs[i])
+		checkassign(lhs[i])
 	}
 
 	assignType := func(i int, typ *types.Type) {
@@ -309,16 +306,13 @@ func tcGoDefer(n *ir.GoDeferStmt) {
 
 	// type is broken or missing, most likely a method call on a broken type
 	// we will warn about the broken type elsewhere. no need to emit a potentially confusing error
-	if n.Call.Type() == nil || n.Call.Type().Broke() {
+	if n.Call.Type() == nil {
 		return
 	}
 
-	if !n.Diag() {
-		// The syntax made sure it was a call, so this must be
-		// a conversion.
-		n.SetDiag(true)
-		base.ErrorfAt(n.Pos(), "%s requires function call, not conversion", what)
-	}
+	// The syntax made sure it was a call, so this must be
+	// a conversion.
+	base.FatalfAt(n.Pos(), "%s requires function call, not conversion", what)
 }
 
 // tcIf typechecks an OIF node.
@@ -611,8 +605,8 @@ func tcSwitchType(n *ir.SwitchStmt) {
 				base.ErrorfAt(ncase.Pos(), "%L is not a type", n1)
 				continue
 			}
-			if !n1.Type().IsInterface() && !implements(n1.Type(), t, &missing, &have, &ptr) && !missing.Broke() {
-				if have != nil && !have.Broke() {
+			if !n1.Type().IsInterface() && !implements(n1.Type(), t, &missing, &have, &ptr) {
+				if have != nil {
 					base.ErrorfAt(ncase.Pos(), "impossible type switch case: %L cannot have dynamic type %v"+
 						" (wrong type for %v method)\n\thave %v%S\n\twant %v%S", guard.X, n1.Type(), missing.Sym, have.Sym, have.Type, missing.Sym, missing.Type)
 				} else if ptr != 0 {
@@ -648,7 +642,6 @@ func tcSwitchType(n *ir.SwitchStmt) {
 			} else {
 				// Clause variable is broken; prevent typechecking.
 				nvar.SetTypecheck(1)
-				nvar.SetWalkdef(1)
 			}
 			ncase.Var = nvar
 		}

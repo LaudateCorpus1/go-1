@@ -11,11 +11,11 @@ package main
 import (
 	"errors"
 	"fmt"
-	exec "internal/execabs"
 	"internal/goversion"
 	"io/fs"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -61,7 +61,6 @@ func main() {
 		"-next", strings.Join(next, ","),
 		"-except", "except.txt",
 	)
-	fmt.Println(cmd.Args)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Fatalf("Error running API checker: %v\n%s", err, out)

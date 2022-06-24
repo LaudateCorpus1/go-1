@@ -35,7 +35,7 @@ type pkgReader struct {
 
 	// offset for rewriting the given index into the output,
 	// but bitwise inverted so we can detect if we're missing the entry or not.
-	newindex []int
+	newindex []pkgbits.Index
 }
 
 func newPkgReader(pr pkgbits.PkgDecoder) *pkgReader {
@@ -46,13 +46,13 @@ func newPkgReader(pr pkgbits.PkgDecoder) *pkgReader {
 		pkgs:     make([]*types.Pkg, pr.NumElems(pkgbits.RelocPkg)),
 		typs:     make([]*types.Type, pr.NumElems(pkgbits.RelocType)),
 
-		newindex: make([]int, pr.TotalElems()),
+		newindex: make([]pkgbits.Index, pr.TotalElems()),
 	}
 }
 
 type pkgReaderIndex struct {
 	pr   *pkgReader
-	idx  int
+	idx  pkgbits.Index
 	dict *readerDict
 }
 
@@ -62,7 +62,7 @@ func (pri pkgReaderIndex) asReader(k pkgbits.RelocKind, marker pkgbits.SyncMarke
 	return r
 }
 
-func (pr *pkgReader) newReader(k pkgbits.RelocKind, idx int, marker pkgbits.SyncMarker) *reader {
+func (pr *pkgReader) newReader(k pkgbits.RelocKind, idx pkgbits.Index, marker pkgbits.SyncMarker) *reader {
 	return &reader{
 		Decoder: pr.NewDecoder(k, idx, marker),
 		p:       pr,
@@ -153,11 +153,6 @@ type itabInfo2 struct {
 func setType(n ir.Node, typ *types.Type) {
 	n.SetType(typ)
 	n.SetTypecheck(1)
-
-	if name, ok := n.(*ir.Name); ok {
-		name.SetWalkdef(1)
-		name.Ntype = ir.TypeNode(name.Type())
-	}
 }
 
 func setValue(name *ir.Name, val constant.Value) {
@@ -187,7 +182,7 @@ func (r *reader) posBase() *src.PosBase {
 	return r.inlPosBase(r.p.posBaseIdx(r.Reloc(pkgbits.RelocPosBase)))
 }
 
-func (pr *pkgReader) posBaseIdx(idx int) *src.PosBase {
+func (pr *pkgReader) posBaseIdx(idx pkgbits.Index) *src.PosBase {
 	if b := pr.posBases[idx]; b != nil {
 		return b
 	}
@@ -210,7 +205,7 @@ func (pr *pkgReader) posBaseIdx(idx int) *src.PosBase {
 	// require being more consistent about when we use native vs UNIX
 	// file paths.
 	const dollarGOROOT = "$GOROOT"
-	if strings.HasPrefix(filename, dollarGOROOT) {
+	if buildcfg.GOROOT != "" && strings.HasPrefix(filename, dollarGOROOT) {
 		filename = buildcfg.GOROOT + filename[len(dollarGOROOT):]
 	}
 
@@ -271,7 +266,7 @@ func (r *reader) pkg() *types.Pkg {
 	return r.p.pkgIdx(r.Reloc(pkgbits.RelocPkg))
 }
 
-func (pr *pkgReader) pkgIdx(idx int) *types.Pkg {
+func (pr *pkgReader) pkgIdx(idx pkgbits.Index) *types.Pkg {
 	if pkg := pr.pkgs[idx]; pkg != nil {
 		return pkg
 	}
@@ -283,11 +278,13 @@ func (pr *pkgReader) pkgIdx(idx int) *types.Pkg {
 
 func (r *reader) doPkg() *types.Pkg {
 	path := r.String()
-	if path == "builtin" {
-		return types.BuiltinPkg
-	}
-	if path == "" {
+	switch path {
+	case "":
 		path = r.p.PkgPath()
+	case "builtin":
+		return types.BuiltinPkg
+	case "unsafe":
+		return types.UnsafePkg
 	}
 
 	name := r.String()
@@ -298,13 +295,13 @@ func (r *reader) doPkg() *types.Pkg {
 	if pkg.Name == "" {
 		pkg.Name = name
 	} else {
-		assert(pkg.Name == name)
+		base.Assertf(pkg.Name == name, "package %q has name %q, but want %q", pkg.Path, pkg.Name, name)
 	}
 
 	if pkg.Height == 0 {
 		pkg.Height = height
 	} else {
-		assert(pkg.Height == height)
+		base.Assertf(pkg.Height == height, "package %q has height %v, but want %v", pkg.Path, pkg.Height, height)
 	}
 
 	return pkg
@@ -325,7 +322,7 @@ func (r *reader) typWrapped(wrapped bool) *types.Type {
 func (r *reader) typInfo() typeInfo {
 	r.Sync(pkgbits.SyncType)
 	if r.Bool() {
-		return typeInfo{idx: r.Len(), derived: true}
+		return typeInfo{idx: pkgbits.Index(r.Len()), derived: true}
 	}
 	return typeInfo{idx: r.Reloc(pkgbits.RelocType), derived: false}
 }
@@ -443,7 +440,19 @@ func (r *reader) doTyp() *types.Type {
 		return r.structType()
 	case pkgbits.TypeInterface:
 		return r.interfaceType()
+	case pkgbits.TypeUnion:
+		return r.unionType()
 	}
+}
+
+func (r *reader) unionType() *types.Type {
+	terms := make([]*types.Type, r.Len())
+	tildes := make([]bool, len(terms))
+	for i := range terms {
+		tildes[i] = r.Bool()
+		terms[i] = r.typ()
+	}
+	return types.NewUnion(terms, tildes)
 }
 
 func (r *reader) interfaceType() *types.Type {
@@ -564,7 +573,7 @@ func (r *reader) obj() ir.Node {
 	return r.p.objIdx(idx, implicits, explicits)
 }
 
-func (pr *pkgReader) objIdx(idx int, implicits, explicits []*types.Type) ir.Node {
+func (pr *pkgReader) objIdx(idx pkgbits.Index, implicits, explicits []*types.Type) ir.Node {
 	rname := pr.newReader(pkgbits.RelocName, idx, pkgbits.SyncObject1)
 	_, sym := rname.qualifiedIdent()
 	tag := pkgbits.CodeObj(rname.Code(pkgbits.SyncCodeObj))
@@ -577,10 +586,6 @@ func (pr *pkgReader) objIdx(idx int, implicits, explicits []*types.Type) ir.Node
 		}
 		if pri, ok := objReader[sym]; ok {
 			return pri.pr.objIdx(pri.idx, nil, explicits)
-		}
-		if haveLegacyImports {
-			assert(len(explicits) == 0)
-			return typecheck.Resolve(ir.NewIdent(src.NoXPos, sym))
 		}
 		base.Fatalf("unresolved stub: %v", sym)
 	}
@@ -636,7 +641,7 @@ func (pr *pkgReader) objIdx(idx int, implicits, explicits []*types.Type) ir.Node
 
 	case pkgbits.ObjFunc:
 		if sym.Name == "init" {
-			sym = renameinit()
+			sym = Renameinit()
 		}
 		name := do(ir.ONAME, true)
 		setType(name, r.signature(sym.Pkg, nil))
@@ -707,7 +712,7 @@ func (r *reader) mangle(sym *types.Sym) *types.Sym {
 	return sym.Pkg.Lookup(buf.String())
 }
 
-func (pr *pkgReader) objDictIdx(sym *types.Sym, idx int, implicits, explicits []*types.Type) *readerDict {
+func (pr *pkgReader) objDictIdx(sym *types.Sym, idx pkgbits.Index, implicits, explicits []*types.Type) *readerDict {
 	r := pr.newReader(pkgbits.RelocObjDict, idx, pkgbits.SyncObject1)
 
 	var dict readerDict
@@ -752,7 +757,7 @@ func (pr *pkgReader) objDictIdx(sym *types.Sym, idx int, implicits, explicits []
 
 	dict.itabs = make([]itabInfo2, r.Len())
 	for i := range dict.itabs {
-		typ := pr.typIdx(typeInfo{idx: r.Len(), derived: true}, &dict, true)
+		typ := pr.typIdx(typeInfo{idx: pkgbits.Index(r.Len()), derived: true}, &dict, true)
 		ifaceInfo := r.typInfo()
 
 		var lsym *obj.LSym
@@ -1631,9 +1636,11 @@ func (r *reader) expr() (res ir.Node) {
 		typ := r.exprType(false)
 
 		if typ, ok := typ.(*ir.DynamicType); ok && typ.Op() == ir.ODYNAMICTYPE {
-			return typed(typ.Type(), ir.NewDynamicTypeAssertExpr(pos, ir.ODYNAMICDOTTYPE, x, typ.X))
+			assert := ir.NewDynamicTypeAssertExpr(pos, ir.ODYNAMICDOTTYPE, x, typ.RType)
+			assert.ITab = typ.ITab
+			return typed(typ.Type(), assert)
 		}
-		return typecheck.Expr(ir.NewTypeAssertExpr(pos, x, typ.(ir.Ntype)))
+		return typecheck.Expr(ir.NewTypeAssertExpr(pos, x, typ.Type()))
 
 	case exprUnaryOp:
 		op := r.op()
@@ -1676,6 +1683,20 @@ func (r *reader) expr() (res ir.Node) {
 		typ := r.typ()
 		pos := r.pos()
 		x := r.expr()
+
+		// TODO(mdempsky): Stop constructing expressions of untyped type.
+		x = typecheck.DefaultLit(x, typ)
+
+		if op, why := typecheck.Convertop(x.Op() == ir.OLITERAL, x.Type(), typ); op == ir.OXXX {
+			// types2 ensured that x is convertable to typ under standard Go
+			// semantics, but cmd/compile also disallows some conversions
+			// involving //go:notinheap.
+			//
+			// TODO(mdempsky): This can be removed after #46731 is implemented.
+			base.ErrorfAt(pos, "cannot convert %L to type %v%v", x, typ, why)
+			base.ErrorExit() // harsh, but prevents constructing invalid IR
+		}
+
 		return typecheck.Expr(ir.NewConvExpr(pos, ir.OCONV, typ, x))
 	}
 }
@@ -1709,7 +1730,7 @@ func (r *reader) compLit() ir.Node {
 		*elemp = wrapName(r.pos(), r.expr())
 	}
 
-	lit := typecheck.Expr(ir.NewCompLitExpr(pos, ir.OCOMPLIT, ir.TypeNode(typ), elems))
+	lit := typecheck.Expr(ir.NewCompLitExpr(pos, ir.OCOMPLIT, typ, elems))
 	if typ0.IsPtr() {
 		lit = typecheck.Expr(typecheck.NodAddrAt(pos, lit))
 		lit.SetType(typ0)
@@ -1787,12 +1808,23 @@ func (r *reader) exprType(nilOK bool) ir.Node {
 
 	pos := r.pos()
 
+	lsymPtr := func(lsym *obj.LSym) ir.Node {
+		return typecheck.Expr(typecheck.NodAddr(ir.NewLinksymExpr(pos, lsym, types.Types[types.TUINT8])))
+	}
+
 	var typ *types.Type
-	var lsym *obj.LSym
+	var rtype, itab ir.Node
 
 	if r.Bool() {
-		itab := r.dict.itabs[r.Len()]
-		typ, lsym = itab.typ, itab.lsym
+		info := r.dict.itabs[r.Len()]
+		typ = info.typ
+
+		// TODO(mdempsky): Populate rtype unconditionally?
+		if typ.IsInterface() {
+			rtype = lsymPtr(info.lsym)
+		} else {
+			itab = lsymPtr(info.lsym)
+		}
 	} else {
 		info := r.typInfo()
 		typ = r.p.typIdx(info, r.dict, true)
@@ -1804,11 +1836,12 @@ func (r *reader) exprType(nilOK bool) ir.Node {
 			return n
 		}
 
-		lsym = reflectdata.TypeLinksym(typ)
+		rtype = lsymPtr(reflectdata.TypeLinksym(typ))
 	}
 
-	ptr := typecheck.Expr(typecheck.NodAddr(ir.NewLinksymExpr(pos, lsym, types.Types[types.TUINT8])))
-	return typed(typ, ir.NewDynamicType(pos, ptr))
+	dt := ir.NewDynamicType(pos, rtype)
+	dt.ITab = itab
+	return typed(typ, dt)
 }
 
 func (r *reader) op() ir.Op {
@@ -1947,12 +1980,6 @@ func InlineCall(call *ir.CallExpr, fn *ir.Func, inlIndex int) *ir.InlinedCallExp
 
 	pri, ok := bodyReader[fn]
 	if !ok {
-		// Assume it's an imported function or something that we don't
-		// have access to in quirks mode.
-		if haveLegacyImports {
-			return nil
-		}
-
 		base.FatalfAt(call.Pos(), "missing function body for call to %v", fn)
 	}
 

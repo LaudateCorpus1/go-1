@@ -14,6 +14,12 @@ package syscall
 
 import "unsafe"
 
+func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
+func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+func Syscall9(num, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno)
+func RawSyscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
+func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+
 type SockaddrDatalink struct {
 	Len    uint8
 	Family uint8
@@ -25,8 +31,6 @@ type SockaddrDatalink struct {
 	Data   [24]int8
 	raw    RawSockaddrDatalink
 }
-
-func Syscall9(num, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno)
 
 func nametomib(name string) (mib []_C_int, err error) {
 	// Perform lookup via a binary search
@@ -66,6 +70,7 @@ func Pipe(p []int) error {
 }
 
 //sysnb pipe2(p *[2]_C_int, flags int) (err error)
+
 func Pipe2(p []int, flags int) error {
 	if len(p) != 2 {
 		return EINVAL
@@ -80,6 +85,7 @@ func Pipe2(p []int, flags int) error {
 }
 
 //sys	accept4(fd int, rsa *RawSockaddrAny, addrlen *_Socklen, flags int) (nfd int, err error)
+
 func Accept4(fd, flags int) (nfd int, sa Sockaddr, err error) {
 	var rsa RawSockaddrAny
 	var len _Socklen = SizeofSockaddrAny
@@ -99,6 +105,7 @@ func Accept4(fd, flags int) (nfd int, sa Sockaddr, err error) {
 }
 
 //sys getdents(fd int, buf []byte) (n int, err error)
+
 func Getdirentries(fd int, buf []byte, basep *uintptr) (n int, err error) {
 	return getdents(fd, buf)
 }

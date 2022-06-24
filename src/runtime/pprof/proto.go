@@ -56,9 +56,10 @@ type memMap struct {
 }
 
 // symbolizeFlag keeps track of symbolization result.
-//   0                  : no symbol lookup was performed
-//   1<<0 (lookupTried) : symbol lookup was performed
-//   1<<1 (lookupFailed): symbol lookup was performed but failed
+//
+//	0                  : no symbol lookup was performed
+//	1<<0 (lookupTried) : symbol lookup was performed
+//	1<<1 (lookupFailed): symbol lookup was performed but failed
 type symbolizeFlag uint8
 
 const (
@@ -245,9 +246,10 @@ type locInfo struct {
 	// https://github.com/golang/go/blob/d6f2f833c93a41ec1c68e49804b8387a06b131c5/src/runtime/traceback.go#L347-L368
 	pcs []uintptr
 
-	// results of allFrames call for this PC
-	frames          []runtime.Frame
-	symbolizeResult symbolizeFlag
+	// firstPCFrames and firstPCSymbolizeResult hold the results of the
+	// allFrames call for the first (leaf-most) PC this locInfo represents
+	firstPCFrames          []runtime.Frame
+	firstPCSymbolizeResult symbolizeFlag
 }
 
 // newProfileBuilder returns a new profileBuilder.
@@ -415,7 +417,7 @@ func (b *profileBuilder) appendLocsForStack(locs []uint64, stk []uintptr) (newLo
 			// stack by trying to add it to the inlining deck before assuming
 			// that the deck is complete.
 			if len(b.deck.pcs) > 0 {
-				if added := b.deck.tryAdd(addr, l.frames, l.symbolizeResult); added {
+				if added := b.deck.tryAdd(addr, l.firstPCFrames, l.firstPCSymbolizeResult); added {
 					stk = stk[1:]
 					continue
 				}
@@ -507,9 +509,10 @@ func (b *profileBuilder) appendLocsForStack(locs []uint64, stk []uintptr) (newLo
 // and looking up debug info is not ideal, so we use a heuristic to filter
 // the fake pcs and restore the inlined and entry functions. Inlined functions
 // have the following properties:
-//   Frame's Func is nil (note: also true for non-Go functions), and
-//   Frame's Entry matches its entry function frame's Entry (note: could also be true for recursive calls and non-Go functions), and
-//   Frame's Name does not match its entry function frame's name (note: inlined functions cannot be directly recursive).
+//
+//	Frame's Func is nil (note: also true for non-Go functions), and
+//	Frame's Entry matches its entry function frame's Entry (note: could also be true for recursive calls and non-Go functions), and
+//	Frame's Name does not match its entry function frame's name (note: inlined functions cannot be directly recursive).
 //
 // As reading and processing the pcs in a stack trace one by one (from leaf to the root),
 // we use pcDeck to temporarily hold the observed pcs and their expanded frames
@@ -518,12 +521,21 @@ type pcDeck struct {
 	pcs             []uintptr
 	frames          []runtime.Frame
 	symbolizeResult symbolizeFlag
+
+	// firstPCFrames indicates the number of frames associated with the first
+	// (leaf-most) PC in the deck
+	firstPCFrames int
+	// firstPCSymbolizeResult holds the results of the allFrames call for the
+	// first (leaf-most) PC in the deck
+	firstPCSymbolizeResult symbolizeFlag
 }
 
 func (d *pcDeck) reset() {
 	d.pcs = d.pcs[:0]
 	d.frames = d.frames[:0]
 	d.symbolizeResult = 0
+	d.firstPCFrames = 0
+	d.firstPCSymbolizeResult = 0
 }
 
 // tryAdd tries to add the pc and Frames expanded from it (most likely one,
@@ -552,6 +564,10 @@ func (d *pcDeck) tryAdd(pc uintptr, frames []runtime.Frame, symbolizeResult symb
 	d.pcs = append(d.pcs, pc)
 	d.frames = append(d.frames, frames...)
 	d.symbolizeResult |= symbolizeResult
+	if len(d.pcs) == 1 {
+		d.firstPCFrames = len(d.frames)
+		d.firstPCSymbolizeResult = symbolizeResult
+	}
 	return true
 }
 
@@ -579,10 +595,10 @@ func (b *profileBuilder) emitLocation() uint64 {
 
 	id := uint64(len(b.locs)) + 1
 	b.locs[addr] = locInfo{
-		id:              id,
-		pcs:             append([]uintptr{}, b.deck.pcs...),
-		symbolizeResult: b.deck.symbolizeResult,
-		frames:          append([]runtime.Frame{}, b.deck.frames...),
+		id:                     id,
+		pcs:                    append([]uintptr{}, b.deck.pcs...),
+		firstPCSymbolizeResult: b.deck.firstPCSymbolizeResult,
+		firstPCFrames:          append([]runtime.Frame{}, b.deck.frames[:b.deck.firstPCFrames]...),
 	}
 
 	start := b.pb.startMessage()

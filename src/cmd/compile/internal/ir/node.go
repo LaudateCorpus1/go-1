@@ -46,8 +46,6 @@ type Node interface {
 	// Storage for analysis passes.
 	Esc() uint16
 	SetEsc(x uint16)
-	Diag() bool
-	SetDiag(x bool)
 
 	// Typecheck values:
 	//  0 means the node is not typechecked
@@ -240,7 +238,6 @@ const (
 	ORECV        // <-X
 	ORUNESTR     // Type(X) (Type is string, X is rune)
 	OSELRECV2    // like OAS2: Lhs = Rhs where len(Lhs)=2, len(Rhs)=1, Rhs[0].Op = ORECV (appears as .Var of OCASE)
-	OIOTA        // iota
 	OREAL        // real(X)
 	OIMAG        // imag(X)
 	OCOMPLEX     // complex(X, Y)
@@ -289,12 +286,6 @@ const (
 	OTYPESW
 	OFUNCINST // instantiation of a generic function
 
-	// types
-	// OTFUNC: func() - Recv is receiver field, Params is list of param fields, Results is
-	// list of result fields.
-	// TODO(mdempsky): Remove.
-	OTFUNC
-
 	// misc
 	// intermediate representation of an inlined call.  Uses Init (assignments
 	// for the captured variables, parameters, retvars, & INLMARK op),
@@ -313,6 +304,7 @@ const (
 	ORESULT        // result of a function call; Xoffset is stack offset
 	OINLMARK       // start of an inlined body, with file/line of caller. Xoffset is an index into the inline tree.
 	OLINKSYMOFFSET // offset within a name
+	OJUMPTABLE     // A jump table structure for implementing dense expression switches
 
 	// opcodes for generics
 	ODYNAMICDOTTYPE  // x = i.(T) where T is a type parameter (or derived from a type parameter)
@@ -461,7 +453,7 @@ const (
 	Noinline                    // func should not be inlined
 	NoCheckPtr                  // func should not be instrumented by checkptr
 	CgoUnsafeArgs               // treat a pointer to one arg as a pointer to them all
-	UintptrKeepAlive            // pointers converted to uintptr must be kept alive (compiler internal only)
+	UintptrKeepAlive            // pointers converted to uintptr must be kept alive
 	UintptrEscapes              // pointers converted to uintptr escape
 
 	// Runtime-only func pragmas.
@@ -554,7 +546,8 @@ func SetPos(n Node) src.XPos {
 }
 
 // The result of InitExpr MUST be assigned back to n, e.g.
-// 	n.X = InitExpr(init, n.X)
+//
+//	n.X = InitExpr(init, n.X)
 func InitExpr(init []Node, expr Node) Node {
 	if len(init) == 0 {
 		return expr
