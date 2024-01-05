@@ -64,6 +64,11 @@ func httpGoroutines(w http.ResponseWriter, r *http.Request) {
 	var glist []gtype
 	for k, v := range gss {
 		v.ID = k
+		// If goroutine didn't run during the trace (no sampled PC),
+		// the v.ID and v.Name will be zero value.
+		if v.ID == 0 && v.Name == "" {
+			v.Name = "(Inactive, no stack trace sampled)"
+		}
 		glist = append(glist, v)
 	}
 	sort.Slice(glist, func(i, j int) bool { return glist[i].ExecTime > glist[j].ExecTime })
@@ -164,7 +169,7 @@ func httpGoroutine(w http.ResponseWriter, r *http.Request) {
 var templGoroutine = template.Must(template.New("").Funcs(template.FuncMap{
 	"prettyDuration": func(nsec int64) template.HTML {
 		d := time.Duration(nsec) * time.Nanosecond
-		return template.HTML(niceDuration(d))
+		return template.HTML(d.String())
 	},
 	"percent": func(dividend, divisor int64) template.HTML {
 		if divisor == 0 {

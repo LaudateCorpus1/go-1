@@ -14,8 +14,6 @@ import (
 	"go/token"
 	"internal/godebug"
 	"internal/goroot"
-	"internal/unsafeheader"
-	"math"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -23,11 +21,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
+	"cmd/go/internal/fsys"
 	"cmd/go/internal/imports"
 	"cmd/go/internal/par"
 	"cmd/go/internal/str"
@@ -37,21 +37,16 @@ import (
 // It will be removed before the release.
 // TODO(matloob): Remove enabled once we have more confidence on the
 // module index.
-var enabled bool = godebug.Get("goindex") != "0"
+var enabled = godebug.New("#goindex").Value() != "0"
 
-// ModuleIndex represents and encoded module index file. It is used to
+// Module represents and encoded module index file. It is used to
 // do the equivalent of build.Import of packages in the module and answer other
 // questions based on the index file's data.
-type ModuleIndex struct {
-	modroot      string
-	od           offsetDecoder
-	packages     map[string]int // offsets of each package
-	packagePaths []string       // paths to package directories relative to modroot; these are the keys of packages
+type Module struct {
+	modroot string
+	d       *decoder
+	n       int // number of packages
 }
-
-var fcache par.Cache
-
-var salt = godebug.Get("goindexsalt")
 
 // moduleHash returns an ActionID corresponding to the state of the module
 // located at filesystem path modroot.
@@ -66,7 +61,7 @@ func moduleHash(modroot string, ismodcache bool) (cache.ActionID, error) {
 		//
 		// Note that this is true even for modules in GOROOT/src: non-release builds
 		// of the Go toolchain may have arbitrary development changes on top of the
-		// commit reported by runtime.Version, or could be completly artificial due
+		// commit reported by runtime.Version, or could be completely artificial due
 		// to lacking a `git` binary (like "devel gomote.XXXXX", as synthesized by
 		// "gomote push" as of 2022-06-15). (Release builds shouldn't have
 		// modifications, but we don't want to use a behavior for releases that we
@@ -75,70 +70,184 @@ func moduleHash(modroot string, ismodcache bool) (cache.ActionID, error) {
 	}
 
 	h := cache.NewHash("moduleIndex")
-	fmt.Fprintf(h, "module index %s %s %s %v\n", runtime.Version(), salt, indexVersion, modroot)
+	// TODO(bcmills): Since modules in the index are checksummed, we could
+	// probably improve the cache hit rate by keying off of the module
+	// path@version (perhaps including the checksum?) instead of the module root
+	// directory.
+	fmt.Fprintf(h, "module index %s %s %v\n", runtime.Version(), indexVersion, modroot)
 	return h.Sum(), nil
 }
 
-var modrootCache par.Cache
+const modTimeCutoff = 2 * time.Second
+
+// dirHash returns an ActionID corresponding to the state of the package
+// located at filesystem path pkgdir.
+func dirHash(modroot, pkgdir string) (cache.ActionID, error) {
+	h := cache.NewHash("moduleIndex")
+	fmt.Fprintf(h, "modroot %s\n", modroot)
+	fmt.Fprintf(h, "package %s %s %v\n", runtime.Version(), indexVersion, pkgdir)
+	entries, err := fsys.ReadDir(pkgdir)
+	if err != nil {
+		// pkgdir might not be a directory. give up on hashing.
+		return cache.ActionID{}, ErrNotIndexed
+	}
+	cutoff := time.Now().Add(-modTimeCutoff)
+	for _, info := range entries {
+		if info.IsDir() {
+			continue
+		}
+
+		if !info.Mode().IsRegular() {
+			return cache.ActionID{}, ErrNotIndexed
+		}
+		// To avoid problems for very recent files where a new
+		// write might not change the mtime due to file system
+		// mtime precision, reject caching if a file was read that
+		// is less than modTimeCutoff old.
+		//
+		// This is the same strategy used for hashing test inputs.
+		// See hashOpen in cmd/go/internal/test/test.go for the
+		// corresponding code.
+		if info.ModTime().After(cutoff) {
+			return cache.ActionID{}, ErrNotIndexed
+		}
+
+		fmt.Fprintf(h, "file %v %v %v\n", info.Name(), info.ModTime(), info.Size())
+	}
+	return h.Sum(), nil
+}
 
 var ErrNotIndexed = errors.New("not in module index")
 
-// Get returns the ModuleIndex for the module rooted at modroot.
+var (
+	errDisabled           = fmt.Errorf("%w: module indexing disabled", ErrNotIndexed)
+	errNotFromModuleCache = fmt.Errorf("%w: not from module cache", ErrNotIndexed)
+)
+
+// GetPackage returns the IndexPackage for the package at the given path.
 // It will return ErrNotIndexed if the directory should be read without
-// using the index, for instance because the index is disabled, or the packgae
+// using the index, for instance because the index is disabled, or the package
 // is not in a module.
-func Get(modroot string) (*ModuleIndex, error) {
-	if !enabled || cache.DefaultDir() == "off" || cfg.BuildMod == "vendor" {
-		return nil, ErrNotIndexed
+func GetPackage(modroot, pkgdir string) (*IndexPackage, error) {
+	mi, err := GetModule(modroot)
+	if err == nil {
+		return mi.Package(relPath(pkgdir, modroot)), nil
 	}
-	if modroot == "" {
-		panic("modindex.Get called with empty modroot")
+	if !errors.Is(err, errNotFromModuleCache) {
+		return nil, err
 	}
-	modroot = filepath.Clean(modroot)
-	isModCache := str.HasFilePathPrefix(modroot, cfg.GOMODCACHE)
-	return openIndex(modroot, isModCache)
+	if cfg.BuildContext.Compiler == "gccgo" && str.HasPathPrefix(modroot, cfg.GOROOTsrc) {
+		return nil, err // gccgo has no sources for GOROOT packages.
+	}
+	return openIndexPackage(modroot, pkgdir)
 }
 
-// openIndex returns the module index for modPath.
+// GetModule returns the Module for the given modroot.
+// It will return ErrNotIndexed if the directory should be read without
+// using the index, for instance because the index is disabled, or the package
+// is not in a module.
+func GetModule(modroot string) (*Module, error) {
+	if !enabled || cache.DefaultDir() == "off" {
+		return nil, errDisabled
+	}
+	if modroot == "" {
+		panic("modindex.GetPackage called with empty modroot")
+	}
+	if cfg.BuildMod == "vendor" {
+		// Even if the main module is in the module cache,
+		// its vendored dependencies are not loaded from their
+		// usual cached locations.
+		return nil, errNotFromModuleCache
+	}
+	modroot = filepath.Clean(modroot)
+	if str.HasFilePathPrefix(modroot, cfg.GOROOTsrc) || !str.HasFilePathPrefix(modroot, cfg.GOMODCACHE) {
+		return nil, errNotFromModuleCache
+	}
+	return openIndexModule(modroot, true)
+}
+
+var mcache par.ErrCache[string, *Module]
+
+// openIndexModule returns the module index for modPath.
 // It will return ErrNotIndexed if the module can not be read
 // using the index because it contains symlinks.
-func openIndex(modroot string, ismodcache bool) (*ModuleIndex, error) {
-	type result struct {
-		mi  *ModuleIndex
-		err error
-	}
-	r := fcache.Do(modroot, func() any {
+func openIndexModule(modroot string, ismodcache bool) (*Module, error) {
+	return mcache.Do(modroot, func() (*Module, error) {
+		fsys.Trace("openIndexModule", modroot)
 		id, err := moduleHash(modroot, ismodcache)
 		if err != nil {
-			return result{nil, err}
+			return nil, err
 		}
-		data, _, err := cache.Default().GetMmap(id)
+		data, _, err := cache.GetMmap(cache.Default(), id)
 		if err != nil {
 			// Couldn't read from modindex. Assume we couldn't read from
 			// the index because the module hasn't been indexed yet.
 			data, err = indexModule(modroot)
 			if err != nil {
-				return result{nil, err}
+				return nil, err
 			}
-			if err = cache.Default().PutBytes(id, data); err != nil {
-				return result{nil, err}
+			if err = cache.PutBytes(cache.Default(), id, data); err != nil {
+				return nil, err
 			}
 		}
 		mi, err := fromBytes(modroot, data)
 		if err != nil {
-			return result{nil, err}
+			return nil, err
 		}
-		return result{mi, nil}
-	}).(result)
-	return r.mi, r.err
+		return mi, nil
+	})
 }
 
-// fromBytes returns a *ModuleIndex given the encoded representation.
-func fromBytes(moddir string, data []byte) (mi *ModuleIndex, err error) {
-	if !enabled {
-		panic("use of index")
-	}
+var pcache par.ErrCache[[2]string, *IndexPackage]
 
+func openIndexPackage(modroot, pkgdir string) (*IndexPackage, error) {
+	return pcache.Do([2]string{modroot, pkgdir}, func() (*IndexPackage, error) {
+		fsys.Trace("openIndexPackage", pkgdir)
+		id, err := dirHash(modroot, pkgdir)
+		if err != nil {
+			return nil, err
+		}
+		data, _, err := cache.GetMmap(cache.Default(), id)
+		if err != nil {
+			// Couldn't read from index. Assume we couldn't read from
+			// the index because the package hasn't been indexed yet.
+			data = indexPackage(modroot, pkgdir)
+			if err = cache.PutBytes(cache.Default(), id, data); err != nil {
+				return nil, err
+			}
+		}
+		pkg, err := packageFromBytes(modroot, data)
+		if err != nil {
+			return nil, err
+		}
+		return pkg, nil
+	})
+}
+
+var errCorrupt = errors.New("corrupt index")
+
+// protect marks the start of a large section of code that accesses the index.
+// It should be used as:
+//
+//	defer unprotect(protect, &err)
+//
+// It should not be used for trivial accesses which would be
+// dwarfed by the overhead of the defer.
+func protect() bool {
+	return debug.SetPanicOnFault(true)
+}
+
+var isTest = false
+
+// unprotect marks the end of a large section of code that accesses the index.
+// It should be used as:
+//
+//	defer unprotect(protect, &err)
+//
+// end looks for panics due to errCorrupt or bad mmap accesses.
+// When it finds them, it adds explanatory text, consumes the panic, and sets *errp instead.
+// If errp is nil, end adds the explanatory text but then calls base.Fatalf.
+func unprotect(old bool, errp *error) {
 	// SetPanicOnFault's errors _may_ satisfy this interface. Even though it's not guaranteed
 	// that all its errors satisfy this interface, we'll only check for these errors so that
 	// we don't suppress panics that could have been produced from other sources.
@@ -146,79 +255,119 @@ func fromBytes(moddir string, data []byte) (mi *ModuleIndex, err error) {
 		Addr() uintptr
 	}
 
-	// set PanicOnFault to true so that we can catch errors on the initial reads of the slice,
-	// in case it's mmapped (the common case).
-	old := debug.SetPanicOnFault(true)
-	defer func() {
-		debug.SetPanicOnFault(old)
-		if e := recover(); e != nil {
-			if _, ok := e.(addrer); ok {
-				// This panic was almost certainly caused by SetPanicOnFault.
-				err = fmt.Errorf("error reading module index: %v", e)
+	debug.SetPanicOnFault(old)
+
+	if e := recover(); e != nil {
+		if _, ok := e.(addrer); ok || e == errCorrupt {
+			// This panic was almost certainly caused by SetPanicOnFault or our panic(errCorrupt).
+			err := fmt.Errorf("error reading module index: %v", e)
+			if errp != nil {
+				*errp = err
 				return
 			}
-			// The panic was likely not caused by SetPanicOnFault.
-			panic(e)
+			if isTest {
+				panic(err)
+			}
+			base.Fatalf("%v", err)
 		}
-	}()
+		// The panic was likely not caused by SetPanicOnFault.
+		panic(e)
+	}
+}
 
-	gotVersion, unread, _ := bytes.Cut(data, []byte{'\n'})
-	if string(gotVersion) != indexVersion {
-		return nil, fmt.Errorf("bad index version string: %q", gotVersion)
-	}
-	stringTableOffset, unread := binary.LittleEndian.Uint32(unread[:4]), unread[4:]
-	st := newStringTable(data[stringTableOffset:])
-	d := decoder{unread, st}
-	numPackages := d.int()
-
-	packagePaths := make([]string, numPackages)
-	for i := range packagePaths {
-		packagePaths[i] = d.string()
-	}
-	packageOffsets := make([]int, numPackages)
-	for i := range packageOffsets {
-		packageOffsets[i] = d.int()
-	}
-	packages := make(map[string]int, numPackages)
-	for i := range packagePaths {
-		packages[packagePaths[i]] = packageOffsets[i]
+// fromBytes returns a *Module given the encoded representation.
+func fromBytes(moddir string, data []byte) (m *Module, err error) {
+	if !enabled {
+		panic("use of index")
 	}
 
-	return &ModuleIndex{
+	defer unprotect(protect(), &err)
+
+	if !bytes.HasPrefix(data, []byte(indexVersion+"\n")) {
+		return nil, errCorrupt
+	}
+
+	const hdr = len(indexVersion + "\n")
+	d := &decoder{data: data}
+	str := d.intAt(hdr)
+	if str < hdr+8 || len(d.data) < str {
+		return nil, errCorrupt
+	}
+	d.data, d.str = data[:str], d.data[str:]
+	// Check that string table looks valid.
+	// First string is empty string (length 0),
+	// and we leave a marker byte 0xFF at the end
+	// just to make sure that the file is not truncated.
+	if len(d.str) == 0 || d.str[0] != 0 || d.str[len(d.str)-1] != 0xFF {
+		return nil, errCorrupt
+	}
+
+	n := d.intAt(hdr + 4)
+	if n < 0 || n > (len(d.data)-8)/8 {
+		return nil, errCorrupt
+	}
+
+	m = &Module{
 		moddir,
-		offsetDecoder{data, st},
-		packages,
-		packagePaths,
-	}, nil
+		d,
+		n,
+	}
+	return m, nil
 }
 
-// Returns a list of directory paths, relative to the modroot, for
-// packages contained in the module index.
-func (mi *ModuleIndex) Packages() []string {
-	return mi.packagePaths
+// packageFromBytes returns a *IndexPackage given the encoded representation.
+func packageFromBytes(modroot string, data []byte) (p *IndexPackage, err error) {
+	m, err := fromBytes(modroot, data)
+	if err != nil {
+		return nil, err
+	}
+	if m.n != 1 {
+		return nil, fmt.Errorf("corrupt single-package index")
+	}
+	return m.pkg(0), nil
 }
 
-// RelPath returns the path relative to the module's root.
-func (mi *ModuleIndex) RelPath(path string) string {
-	return str.TrimFilePathPrefix(filepath.Clean(path), mi.modroot) // mi.modroot is already clean
+// pkgDir returns the dir string of the i'th package in the index.
+func (m *Module) pkgDir(i int) string {
+	if i < 0 || i >= m.n {
+		panic(errCorrupt)
+	}
+	return m.d.stringAt(12 + 8 + 8*i)
 }
 
-// ImportPackage is the equivalent of build.Import given the information in ModuleIndex.
-func (mi *ModuleIndex) Import(bctxt build.Context, relpath string, mode build.ImportMode) (p *build.Package, err error) {
-	rp := mi.indexPackage(relpath)
+// pkgOff returns the offset of the data for the i'th package in the index.
+func (m *Module) pkgOff(i int) int {
+	if i < 0 || i >= m.n {
+		panic(errCorrupt)
+	}
+	return m.d.intAt(12 + 8 + 8*i + 4)
+}
 
-	defer func() {
-		if e := recover(); e != nil {
-			err = fmt.Errorf("error reading module index: %v", e)
-		}
-	}()
+// Walk calls f for each package in the index, passing the path to that package relative to the module root.
+func (m *Module) Walk(f func(path string)) {
+	defer unprotect(protect(), nil)
+	for i := 0; i < m.n; i++ {
+		f(m.pkgDir(i))
+	}
+}
+
+// relPath returns the path relative to the module's root.
+func relPath(path, modroot string) string {
+	return str.TrimFilePathPrefix(filepath.Clean(path), filepath.Clean(modroot))
+}
+
+var installgorootAll = godebug.New("installgoroot").Value() == "all"
+
+// Import is the equivalent of build.Import given the information in Module.
+func (rp *IndexPackage) Import(bctxt build.Context, mode build.ImportMode) (p *build.Package, err error) {
+	defer unprotect(protect(), &err)
 
 	ctxt := (*Context)(&bctxt)
 
 	p = &build.Package{}
 
 	p.ImportPath = "."
-	p.Dir = filepath.Join(mi.modroot, rp.dir)
+	p.Dir = filepath.Join(rp.modroot, rp.dir)
 
 	var pkgerr error
 	switch ctxt.Compiler {
@@ -236,64 +385,51 @@ func (mi *ModuleIndex) Import(bctxt build.Context, relpath string, mode build.Im
 	inTestdata := func(sub string) bool {
 		return strings.Contains(sub, "/testdata/") || strings.HasSuffix(sub, "/testdata") || str.HasPathPrefix(sub, "testdata")
 	}
-	if !inTestdata(relpath) {
+	var pkga string
+	if !inTestdata(rp.dir) {
 		// In build.go, p.Root should only be set in the non-local-import case, or in
 		// GOROOT or GOPATH. Since module mode only calls Import with path set to "."
 		// and the module index doesn't apply outside modules, the GOROOT case is
-		// the only case where GOROOT needs to be set.
-		// But: p.Root is actually set in the local-import case outside GOROOT, if
-		// the directory is contained in GOPATH/src
-		// TODO(#37015): fix that behavior in go/build and remove the gopath case
-		// below.
+		// the only case where p.Root needs to be set.
 		if ctxt.GOROOT != "" && str.HasFilePathPrefix(p.Dir, cfg.GOROOTsrc) && p.Dir != cfg.GOROOTsrc {
 			p.Root = ctxt.GOROOT
 			p.Goroot = true
-			modprefix := str.TrimFilePathPrefix(mi.modroot, cfg.GOROOTsrc)
-			p.ImportPath = relpath
+			modprefix := str.TrimFilePathPrefix(rp.modroot, cfg.GOROOTsrc)
+			p.ImportPath = rp.dir
 			if modprefix != "" {
 				p.ImportPath = filepath.Join(modprefix, p.ImportPath)
 			}
-		}
-		for _, root := range ctxt.gopath() {
-			// TODO(matloob): do we need to reimplement the conflictdir logic?
 
-			// TODO(matloob): ctxt.hasSubdir evaluates symlinks, so it
-			// can be slower than we'd like. Find out if we can drop this
-			// logic before the release.
-			if sub, ok := ctxt.hasSubdir(filepath.Join(root, "src"), p.Dir); ok {
-				p.ImportPath = sub
-				p.Root = root
+			// Set GOROOT-specific fields (sometimes for modules in a GOPATH directory).
+			// The fields set below (SrcRoot, PkgRoot, BinDir, PkgTargetRoot, and PkgObj)
+			// are only set in build.Import if p.Root != "".
+			var pkgtargetroot string
+			suffix := ""
+			if ctxt.InstallSuffix != "" {
+				suffix = "_" + ctxt.InstallSuffix
 			}
-		}
-	}
-	if p.Root != "" {
-		// Set GOROOT-specific fields (sometimes for modules in a GOPATH directory).
-		// The fields set below (SrcRoot, PkgRoot, BinDir, PkgTargetRoot, and PkgObj)
-		// are only set in build.Import if p.Root != "". As noted in the comment
-		// on setting p.Root above, p.Root should only be set in the GOROOT case for the
-		// set of packages we care about, but is also set for modules in a GOPATH src
-		// directory.
-		var pkgtargetroot string
-		var pkga string
-		suffix := ""
-		if ctxt.InstallSuffix != "" {
-			suffix = "_" + ctxt.InstallSuffix
-		}
-		switch ctxt.Compiler {
-		case "gccgo":
-			pkgtargetroot = "pkg/gccgo_" + ctxt.GOOS + "_" + ctxt.GOARCH + suffix
-			dir, elem := path.Split(p.ImportPath)
-			pkga = pkgtargetroot + "/" + dir + "lib" + elem + ".a"
-		case "gc":
-			pkgtargetroot = "pkg/" + ctxt.GOOS + "_" + ctxt.GOARCH + suffix
-			pkga = pkgtargetroot + "/" + p.ImportPath + ".a"
-		}
-		p.SrcRoot = ctxt.joinPath(p.Root, "src")
-		p.PkgRoot = ctxt.joinPath(p.Root, "pkg")
-		p.BinDir = ctxt.joinPath(p.Root, "bin")
-		if pkga != "" {
-			p.PkgTargetRoot = ctxt.joinPath(p.Root, pkgtargetroot)
-			p.PkgObj = ctxt.joinPath(p.Root, pkga)
+			switch ctxt.Compiler {
+			case "gccgo":
+				pkgtargetroot = "pkg/gccgo_" + ctxt.GOOS + "_" + ctxt.GOARCH + suffix
+				dir, elem := path.Split(p.ImportPath)
+				pkga = pkgtargetroot + "/" + dir + "lib" + elem + ".a"
+			case "gc":
+				pkgtargetroot = "pkg/" + ctxt.GOOS + "_" + ctxt.GOARCH + suffix
+				pkga = pkgtargetroot + "/" + p.ImportPath + ".a"
+			}
+			p.SrcRoot = ctxt.joinPath(p.Root, "src")
+			p.PkgRoot = ctxt.joinPath(p.Root, "pkg")
+			p.BinDir = ctxt.joinPath(p.Root, "bin")
+			if pkga != "" {
+				// Always set PkgTargetRoot. It might be used when building in shared
+				// mode.
+				p.PkgTargetRoot = ctxt.joinPath(p.Root, pkgtargetroot)
+
+				// Set the install target if applicable.
+				if !p.Goroot || (installgorootAll && p.ImportPath != "unsafe" && p.ImportPath != "builtin") {
+					p.PkgObj = ctxt.joinPath(p.Root, pkga)
+				}
+			}
 		}
 	}
 
@@ -310,14 +446,14 @@ func (mi *ModuleIndex) Import(bctxt build.Context, relpath string, mode build.Im
 
 	// We need to do a second round of bad file processing.
 	var badGoError error
-	badFiles := make(map[string]bool)
-	badFile := func(name string, err error) {
+	badGoFiles := make(map[string]bool)
+	badGoFile := func(name string, err error) {
 		if badGoError == nil {
 			badGoError = err
 		}
-		if !badFiles[name] {
+		if !badGoFiles[name] {
 			p.InvalidGoFiles = append(p.InvalidGoFiles, name)
-			badFiles[name] = true
+			badGoFiles[name] = true
 		}
 	}
 
@@ -332,12 +468,16 @@ func (mi *ModuleIndex) Import(bctxt build.Context, relpath string, mode build.Im
 	allTags := make(map[string]bool)
 	for _, tf := range rp.sourceFiles {
 		name := tf.name()
-		if error := tf.error(); error != "" {
-			badFile(name, errors.New(tf.error()))
-			continue
-		} else if parseError := tf.parseError(); parseError != "" {
-			badFile(name, parseErrorFromString(tf.parseError()))
-			// Fall through: we still want to list files with parse errors.
+		// Check errors for go files and call badGoFiles to put them in
+		// InvalidGoFiles if they do have an error.
+		if strings.HasSuffix(name, ".go") {
+			if error := tf.error(); error != "" {
+				badGoFile(name, errors.New(tf.error()))
+				continue
+			} else if parseError := tf.parseError(); parseError != "" {
+				badGoFile(name, parseErrorFromString(tf.parseError()))
+				// Fall through: we still want to list files with parse errors.
+			}
 		}
 
 		var shouldBuild = true
@@ -363,7 +503,7 @@ func (mi *ModuleIndex) Import(bctxt build.Context, relpath string, mode build.Im
 		if !shouldBuild || tf.ignoreFile() {
 			if ext == ".go" {
 				p.IgnoredGoFiles = append(p.IgnoredGoFiles, name)
-			} else if fileListForExt((*Package)(p), ext) != nil {
+			} else if fileListForExt(p, ext) != nil {
 				p.IgnoredOtherFiles = append(p.IgnoredOtherFiles, name)
 			}
 			continue
@@ -378,7 +518,7 @@ func (mi *ModuleIndex) Import(bctxt build.Context, relpath string, mode build.Im
 			Sfiles = append(Sfiles, name)
 			continue
 		default:
-			if list := fileListForExt((*Package)(p), ext); list != nil {
+			if list := fileListForExt(p, ext); list != nil {
 				*list = append(*list, name)
 			}
 			continue
@@ -407,7 +547,7 @@ func (mi *ModuleIndex) Import(bctxt build.Context, relpath string, mode build.Im
 			// TODO(#45999): The choice of p.Name is arbitrary based on file iteration
 			// order. Instead of resolving p.Name arbitrarily, we should clear out the
 			// existing Name and mark the existing files as also invalid.
-			badFile(name, &MultiplePackageError{
+			badGoFile(name, &MultiplePackageError{
 				Dir:      p.Dir,
 				Packages: []string{p.Name, pkg},
 				Files:    []string{firstFile, name},
@@ -426,20 +566,21 @@ func (mi *ModuleIndex) Import(bctxt build.Context, relpath string, mode build.Im
 		for _, imp := range imports {
 			if imp.path == "C" {
 				if isTest {
-					badFile(name, fmt.Errorf("use of cgo in test %s not supported", name))
+					badGoFile(name, fmt.Errorf("use of cgo in test %s not supported", name))
 					continue
 				}
 				isCgo = true
 			}
 		}
 		if directives := tf.cgoDirectives(); directives != "" {
-			if err := ctxt.saveCgo(name, (*Package)(p), directives); err != nil {
-				badFile(name, err)
+			if err := ctxt.saveCgo(name, p, directives); err != nil {
+				badGoFile(name, err)
 			}
 		}
 
 		var fileList *[]string
 		var importMap, embedMap map[string][]token.Position
+		var directives *[]build.Directive
 		switch {
 		case isCgo:
 			allTags["cgo"] = true
@@ -447,6 +588,7 @@ func (mi *ModuleIndex) Import(bctxt build.Context, relpath string, mode build.Im
 				fileList = &p.CgoFiles
 				importMap = importPos
 				embedMap = embedPos
+				directives = &p.Directives
 			} else {
 				// Ignore Imports and Embeds from cgo files if cgo is disabled.
 				fileList = &p.IgnoredGoFiles
@@ -455,14 +597,17 @@ func (mi *ModuleIndex) Import(bctxt build.Context, relpath string, mode build.Im
 			fileList = &p.XTestGoFiles
 			importMap = xTestImportPos
 			embedMap = xTestEmbedPos
+			directives = &p.XTestDirectives
 		case isTest:
 			fileList = &p.TestGoFiles
 			importMap = testImportPos
 			embedMap = testEmbedPos
+			directives = &p.TestDirectives
 		default:
 			fileList = &p.GoFiles
 			importMap = importPos
 			embedMap = embedPos
+			directives = &p.Directives
 		}
 		*fileList = append(*fileList, name)
 		if importMap != nil {
@@ -474,6 +619,9 @@ func (mi *ModuleIndex) Import(bctxt build.Context, relpath string, mode build.Im
 			for _, e := range tf.embeds() {
 				embedMap[e.pattern] = append(embedMap[e.pattern], e.position)
 			}
+		}
+		if directives != nil {
+			*directives = append(*directives, tf.directives()...)
 		}
 	}
 
@@ -521,20 +669,21 @@ func IsStandardPackage(goroot_, compiler, path string) bool {
 		reldir = str.TrimFilePathPrefix(reldir, "cmd")
 		modroot = filepath.Join(modroot, "cmd")
 	}
-	mod, err := Get(modroot)
-	if err != nil {
+	if _, err := GetPackage(modroot, filepath.Join(modroot, reldir)); err == nil {
+		// Note that goroot.IsStandardPackage doesn't check that the directory
+		// actually contains any go files-- merely that it exists. GetPackage
+		// returning a nil error is enough for us to know the directory exists.
+		return true
+	} else if errors.Is(err, ErrNotIndexed) {
+		// Fall back because package isn't indexable. (Probably because
+		// a file was modified recently)
 		return goroot.IsStandardPackage(goroot_, compiler, path)
 	}
-
-	pkgs := mod.Packages()
-	i := sort.SearchStrings(pkgs, reldir)
-	return i != len(pkgs) && pkgs[i] == reldir
+	return false
 }
 
 // IsDirWithGoFiles is the equivalent of fsys.IsDirWithGoFiles using the information in the index.
-func (mi *ModuleIndex) IsDirWithGoFiles(relpath string) (_ bool, err error) {
-	rp := mi.indexPackage(relpath)
-
+func (rp *IndexPackage) IsDirWithGoFiles() (_ bool, err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			err = fmt.Errorf("error reading module index: %v", e)
@@ -549,9 +698,7 @@ func (mi *ModuleIndex) IsDirWithGoFiles(relpath string) (_ bool, err error) {
 }
 
 // ScanDir implements imports.ScanDir using the information in the index.
-func (mi *ModuleIndex) ScanDir(path string, tags map[string]bool) (sortedImports []string, sortedTestImports []string, err error) {
-	rp := mi.indexPackage(path)
-
+func (rp *IndexPackage) ScanDir(tags map[string]bool) (sortedImports []string, sortedTestImports []string, err error) {
 	// TODO(matloob) dir should eventually be relative to indexed directory
 	// TODO(matloob): skip reading raw package and jump straight to data we need?
 
@@ -630,7 +777,7 @@ func shouldBuild(sf *sourceFile, tags map[string]bool) bool {
 	plusBuildConstraints := sf.plusBuildConstraints()
 	for _, text := range plusBuildConstraints {
 		if x, err := constraint.Parse(text); err == nil {
-			if imports.Eval(x, tags, true) == false {
+			if !imports.Eval(x, tags, true) {
 				return false
 			}
 		}
@@ -639,11 +786,13 @@ func shouldBuild(sf *sourceFile, tags map[string]bool) bool {
 	return true
 }
 
-// index package holds the information needed to access information in the
-// index about a package.
-type indexPackage struct {
+// IndexPackage holds the information needed to access information in the
+// index needed to load a package in a specific directory.
+type IndexPackage struct {
 	error error
 	dir   string // directory of the package relative to the modroot
+
+	modroot string
 
 	// Source files
 	sourceFiles []*sourceFile
@@ -651,40 +800,44 @@ type indexPackage struct {
 
 var errCannotFindPackage = errors.New("cannot find package")
 
-// indexPackage returns an indexPackage constructed using the information in the ModuleIndex.
-func (mi *ModuleIndex) indexPackage(path string) *indexPackage {
-	defer func() {
-		if e := recover(); e != nil {
-			base.Fatalf("error reading module index: %v", e)
-		}
-	}()
-	offset, ok := mi.packages[path]
-	if !ok {
-		return &indexPackage{error: fmt.Errorf("%w %q in:\n\t%s", errCannotFindPackage, path, filepath.Join(mi.modroot, path))}
-	}
+// Package and returns finds the package with the given path (relative to the module root).
+// If the package does not exist, Package returns an IndexPackage that will return an
+// appropriate error from its methods.
+func (m *Module) Package(path string) *IndexPackage {
+	defer unprotect(protect(), nil)
 
-	// TODO(matloob): do we want to lock on the module index?
-	d := mi.od.decoderAt(offset)
-	rp := new(indexPackage)
-	if errstr := d.string(); errstr != "" {
-		rp.error = errors.New(errstr)
+	i, ok := sort.Find(m.n, func(i int) int {
+		return strings.Compare(path, m.pkgDir(i))
+	})
+	if !ok {
+		return &IndexPackage{error: fmt.Errorf("%w %q in:\n\t%s", errCannotFindPackage, path, filepath.Join(m.modroot, path))}
 	}
-	rp.dir = d.string()
-	numSourceFiles := d.uint32()
-	rp.sourceFiles = make([]*sourceFile, numSourceFiles)
-	for i := uint32(0); i < numSourceFiles; i++ {
-		offset := d.uint32()
-		rp.sourceFiles[i] = &sourceFile{
-			od: mi.od.offsetDecoderAt(offset),
+	return m.pkg(i)
+}
+
+// pkg returns the i'th IndexPackage in m.
+func (m *Module) pkg(i int) *IndexPackage {
+	r := m.d.readAt(m.pkgOff(i))
+	p := new(IndexPackage)
+	if errstr := r.string(); errstr != "" {
+		p.error = errors.New(errstr)
+	}
+	p.dir = r.string()
+	p.sourceFiles = make([]*sourceFile, r.int())
+	for i := range p.sourceFiles {
+		p.sourceFiles[i] = &sourceFile{
+			d:   m.d,
+			pos: r.int(),
 		}
 	}
-	return rp
+	p.modroot = m.modroot
+	return p
 }
 
 // sourceFile represents the information of a given source file in the module index.
 type sourceFile struct {
-	od offsetDecoder // od interprets all offsets relative to the start of the source file's data
-
+	d               *decoder // encoding of this source file
+	pos             int      // start of sourceFile encoding in d
 	onceReadImports sync.Once
 	savedImports    []rawImport // saved imports so that they're only read once
 }
@@ -704,73 +857,74 @@ const (
 )
 
 func (sf *sourceFile) error() string {
-	return sf.od.stringAt(sourceFileError)
+	return sf.d.stringAt(sf.pos + sourceFileError)
 }
 func (sf *sourceFile) parseError() string {
-	return sf.od.stringAt(sourceFileParseError)
-}
-func (sf *sourceFile) name() string {
-	return sf.od.stringAt(sourceFileName)
+	return sf.d.stringAt(sf.pos + sourceFileParseError)
 }
 func (sf *sourceFile) synopsis() string {
-	return sf.od.stringAt(sourceFileSynopsis)
+	return sf.d.stringAt(sf.pos + sourceFileSynopsis)
+}
+func (sf *sourceFile) name() string {
+	return sf.d.stringAt(sf.pos + sourceFileName)
 }
 func (sf *sourceFile) pkgName() string {
-	return sf.od.stringAt(sourceFilePkgName)
+	return sf.d.stringAt(sf.pos + sourceFilePkgName)
 }
 func (sf *sourceFile) ignoreFile() bool {
-	return sf.od.boolAt(sourceFileIgnoreFile)
+	return sf.d.boolAt(sf.pos + sourceFileIgnoreFile)
 }
 func (sf *sourceFile) binaryOnly() bool {
-	return sf.od.boolAt(sourceFileBinaryOnly)
+	return sf.d.boolAt(sf.pos + sourceFileBinaryOnly)
 }
 func (sf *sourceFile) cgoDirectives() string {
-	return sf.od.stringAt(sourceFileCgoDirectives)
+	return sf.d.stringAt(sf.pos + sourceFileCgoDirectives)
 }
 func (sf *sourceFile) goBuildConstraint() string {
-	return sf.od.stringAt(sourceFileGoBuildConstraint)
+	return sf.d.stringAt(sf.pos + sourceFileGoBuildConstraint)
 }
 
 func (sf *sourceFile) plusBuildConstraints() []string {
-	d := sf.od.decoderAt(sourceFileNumPlusBuildConstraints)
-	n := d.int()
+	pos := sf.pos + sourceFileNumPlusBuildConstraints
+	n := sf.d.intAt(pos)
+	pos += 4
 	ret := make([]string, n)
 	for i := 0; i < n; i++ {
-		ret[i] = d.string()
+		ret[i] = sf.d.stringAt(pos)
+		pos += 4
 	}
 	return ret
 }
 
-func importsOffset(numPlusBuildConstraints int) int {
-	// 4 bytes per uin32, add one to advance past numPlusBuildConstraints itself
-	return sourceFileNumPlusBuildConstraints + 4*(numPlusBuildConstraints+1)
-}
-
 func (sf *sourceFile) importsOffset() int {
-	numPlusBuildConstraints := sf.od.intAt(sourceFileNumPlusBuildConstraints)
-	return importsOffset(numPlusBuildConstraints)
-}
-
-func embedsOffset(importsOffset, numImports int) int {
-	// 4 bytes per uint32; 1 to advance past numImports itself, and 5 uint32s per import
-	return importsOffset + 4*(1+(5*numImports))
+	pos := sf.pos + sourceFileNumPlusBuildConstraints
+	n := sf.d.intAt(pos)
+	// each build constraint is 1 uint32
+	return pos + 4 + n*4
 }
 
 func (sf *sourceFile) embedsOffset() int {
-	importsOffset := sf.importsOffset()
-	numImports := sf.od.intAt(importsOffset)
-	return embedsOffset(importsOffset, numImports)
+	pos := sf.importsOffset()
+	n := sf.d.intAt(pos)
+	// each import is 5 uint32s (string + tokpos)
+	return pos + 4 + n*(4*5)
+}
+
+func (sf *sourceFile) directivesOffset() int {
+	pos := sf.embedsOffset()
+	n := sf.d.intAt(pos)
+	// each embed is 5 uint32s (string + tokpos)
+	return pos + 4 + n*(4*5)
 }
 
 func (sf *sourceFile) imports() []rawImport {
 	sf.onceReadImports.Do(func() {
 		importsOffset := sf.importsOffset()
-		d := sf.od.decoderAt(importsOffset)
-		numImports := d.int()
+		r := sf.d.readAt(importsOffset)
+		numImports := r.int()
 		ret := make([]rawImport, numImports)
 		for i := 0; i < numImports; i++ {
-			ret[i].path = d.string()
-			ret[i].position = d.tokpos()
+			ret[i] = rawImport{r.string(), r.tokpos()}
 		}
 		sf.savedImports = ret
 	})
@@ -779,132 +933,105 @@ func (sf *sourceFile) imports() []rawImport {
 
 func (sf *sourceFile) embeds() []embed {
 	embedsOffset := sf.embedsOffset()
-	d := sf.od.decoderAt(embedsOffset)
-	numEmbeds := d.int()
+	r := sf.d.readAt(embedsOffset)
+	numEmbeds := r.int()
 	ret := make([]embed, numEmbeds)
 	for i := range ret {
-		pattern := d.string()
-		pos := d.tokpos()
-		ret[i] = embed{pattern, pos}
+		ret[i] = embed{r.string(), r.tokpos()}
 	}
 	return ret
 }
 
-// A decoder reads from the current position of the file and advances its position as it
-// reads.
-type decoder struct {
-	b  []byte
-	st *stringTable
-}
-
-func (d *decoder) uint32() uint32 {
-	n := binary.LittleEndian.Uint32(d.b[:4])
-	d.b = d.b[4:]
-	return n
-}
-
-func (d *decoder) int() int {
-	n := d.uint32()
-	if int64(n) > math.MaxInt {
-		base.Fatalf("go: attempting to read a uint32 from the index that overflows int")
+func (sf *sourceFile) directives() []build.Directive {
+	directivesOffset := sf.directivesOffset()
+	r := sf.d.readAt(directivesOffset)
+	numDirectives := r.int()
+	ret := make([]build.Directive, numDirectives)
+	for i := range ret {
+		ret[i] = build.Directive{Text: r.string(), Pos: r.tokpos()}
 	}
-	return int(n)
-}
-
-func (d *decoder) tokpos() token.Position {
-	file := d.string()
-	offset := d.int()
-	line := d.int()
-	column := d.int()
-	return token.Position{
-		Filename: file,
-		Offset:   offset,
-		Line:     line,
-		Column:   column,
-	}
-}
-
-func (d *decoder) string() string {
-	return d.st.string(d.int())
-}
-
-// And offset decoder reads information offset from its position in the file.
-// It's either offset from the beginning of the index, or the beginning of a sourceFile's data.
-type offsetDecoder struct {
-	b  []byte
-	st *stringTable
-}
-
-func (od *offsetDecoder) uint32At(offset int) uint32 {
-	if offset > len(od.b) {
-		base.Fatalf("go: trying to read from index file at offset higher than file length. This indicates a corrupt offset file in the cache.")
-	}
-	return binary.LittleEndian.Uint32(od.b[offset:])
-}
-
-func (od *offsetDecoder) intAt(offset int) int {
-	n := od.uint32At(offset)
-	if int64(n) > math.MaxInt {
-		base.Fatalf("go: attempting to read a uint32 from the index that overflows int")
-	}
-	return int(n)
-}
-
-func (od *offsetDecoder) boolAt(offset int) bool {
-	switch v := od.uint32At(offset); v {
-	case 0:
-		return false
-	case 1:
-		return true
-	default:
-		base.Fatalf("go: invalid bool value in index file encoding: %v", v)
-	}
-	panic("unreachable")
-}
-
-func (od *offsetDecoder) stringAt(offset int) string {
-	return od.st.string(od.intAt(offset))
-}
-
-func (od *offsetDecoder) decoderAt(offset int) *decoder {
-	return &decoder{od.b[offset:], od.st}
-}
-
-func (od *offsetDecoder) offsetDecoderAt(offset uint32) offsetDecoder {
-	return offsetDecoder{od.b[offset:], od.st}
-}
-
-type stringTable struct {
-	b []byte
-}
-
-func newStringTable(b []byte) *stringTable {
-	return &stringTable{b: b}
-}
-
-func (st *stringTable) string(pos int) string {
-	if pos == 0 {
-		return ""
-	}
-
-	bb := st.b[pos:]
-	i := bytes.IndexByte(bb, 0)
-
-	if i == -1 {
-		panic("reached end of string table trying to read string")
-	}
-	s := asString(bb[:i])
-
-	return s
+	return ret
 }
 
 func asString(b []byte) string {
-	p := (*unsafeheader.Slice)(unsafe.Pointer(&b)).Data
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
 
-	var s string
-	hdr := (*unsafeheader.String)(unsafe.Pointer(&s))
-	hdr.Data = p
-	hdr.Len = len(b)
+// A decoder helps decode the index format.
+type decoder struct {
+	data []byte // data after header
+	str  []byte // string table
+}
 
-	return s
+// intAt returns the int at the given offset in d.data.
+func (d *decoder) intAt(off int) int {
+	if off < 0 || len(d.data)-off < 4 {
+		panic(errCorrupt)
+	}
+	i := binary.LittleEndian.Uint32(d.data[off : off+4])
+	if int32(i)>>31 != 0 {
+		panic(errCorrupt)
+	}
+	return int(i)
+}
+
+// boolAt returns the bool at the given offset in d.data.
+func (d *decoder) boolAt(off int) bool {
+	return d.intAt(off) != 0
+}
+
+// stringAt returns the string pointed at by the int at the given offset in d.data.
+func (d *decoder) stringAt(off int) string {
+	return d.stringTableAt(d.intAt(off))
+}
+
+// stringTableAt returns the string at the given offset in the string table d.str.
+func (d *decoder) stringTableAt(off int) string {
+	if off < 0 || off >= len(d.str) {
+		panic(errCorrupt)
+	}
+	s := d.str[off:]
+	v, n := binary.Uvarint(s)
+	if n <= 0 || v > uint64(len(s[n:])) {
+		panic(errCorrupt)
+	}
+	return asString(s[n : n+int(v)])
+}
+
+// A reader reads sequential fields from a section of the index format.
+type reader struct {
+	d   *decoder
+	pos int
+}
+
+// readAt returns a reader starting at the given position in d.
+func (d *decoder) readAt(pos int) *reader {
+	return &reader{d, pos}
+}
+
+// int reads the next int.
+func (r *reader) int() int {
+	i := r.d.intAt(r.pos)
+	r.pos += 4
+	return i
+}
+
+// string reads the next string.
+func (r *reader) string() string {
+	return r.d.stringTableAt(r.int())
+}
+
+// bool reads the next bool.
+func (r *reader) bool() bool {
+	return r.int() != 0
+}
+
+// tokpos reads the next token.Position.
+func (r *reader) tokpos() token.Position {
+	return token.Position{
+		Filename: r.string(),
+		Offset:   r.int(),
+		Line:     r.int(),
+		Column:   r.int(),
+	}
 }

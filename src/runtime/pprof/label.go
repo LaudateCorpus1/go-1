@@ -54,11 +54,11 @@ func (l *labelMap) String() string {
 	return "{" + strings.Join(keyVals, ", ") + "}"
 }
 
-// WithLabels returns a new context.Context with the given labels added.
+// WithLabels returns a new [context.Context] with the given labels added.
 // A label overwrites a prior label with the same key.
 func WithLabels(ctx context.Context, labels LabelSet) context.Context {
-	childLabels := make(labelMap)
 	parentLabels := labelValue(ctx)
+	childLabels := make(labelMap, len(parentLabels))
 	// TODO(matloob): replace the map implementation with something
 	// more efficient so creating a child context WithLabels doesn't need
 	// to clone the map.
@@ -72,7 +72,7 @@ func WithLabels(ctx context.Context, labels LabelSet) context.Context {
 }
 
 // Labels takes an even number of strings representing key-value pairs
-// and makes a LabelSet containing them.
+// and makes a [LabelSet] containing them.
 // A label overwrites a prior label with the same key.
 // Currently only the CPU and goroutine profiles utilize any labels
 // information.

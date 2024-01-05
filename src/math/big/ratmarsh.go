@@ -10,12 +10,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 )
 
 // Gob codec version. Permits backward-compatible changes to the encoding.
 const ratGobVersion byte = 1
 
-// GobEncode implements the gob.GobEncoder interface.
+// GobEncode implements the [encoding/gob.GobEncoder] interface.
 func (x *Rat) GobEncode() ([]byte, error) {
 	if x == nil {
 		return nil, nil
@@ -38,26 +39,36 @@ func (x *Rat) GobEncode() ([]byte, error) {
 	return buf[j:], nil
 }
 
-// GobDecode implements the gob.GobDecoder interface.
+// GobDecode implements the [encoding/gob.GobDecoder] interface.
 func (z *Rat) GobDecode(buf []byte) error {
 	if len(buf) == 0 {
 		// Other side sent a nil or default value.
 		*z = Rat{}
 		return nil
 	}
+	if len(buf) < 5 {
+		return errors.New("Rat.GobDecode: buffer too small")
+	}
 	b := buf[0]
 	if b>>1 != ratGobVersion {
 		return fmt.Errorf("Rat.GobDecode: encoding version %d not supported", b>>1)
 	}
 	const j = 1 + 4
-	i := j + binary.BigEndian.Uint32(buf[j-4:j])
+	ln := binary.BigEndian.Uint32(buf[j-4 : j])
+	if uint64(ln) > math.MaxInt-j {
+		return errors.New("Rat.GobDecode: invalid length")
+	}
+	i := j + int(ln)
+	if len(buf) < i {
+		return errors.New("Rat.GobDecode: buffer too small")
+	}
 	z.a.neg = b&1 != 0
 	z.a.abs = z.a.abs.setBytes(buf[j:i])
 	z.b.abs = z.b.abs.setBytes(buf[i:])
 	return nil
 }
 
-// MarshalText implements the encoding.TextMarshaler interface.
+// MarshalText implements the [encoding.TextMarshaler] interface.
 func (x *Rat) MarshalText() (text []byte, err error) {
 	if x.IsInt() {
 		return x.a.MarshalText()
@@ -65,7 +76,7 @@ func (x *Rat) MarshalText() (text []byte, err error) {
 	return x.marshal(), nil
 }
 
-// UnmarshalText implements the encoding.TextUnmarshaler interface.
+// UnmarshalText implements the [encoding.TextUnmarshaler] interface.
 func (z *Rat) UnmarshalText(text []byte) error {
 	// TODO(gri): get rid of the []byte/string conversion
 	if _, ok := z.SetString(string(text)); !ok {

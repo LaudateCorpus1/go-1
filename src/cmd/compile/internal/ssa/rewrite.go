@@ -7,6 +7,7 @@ package ssa
 import (
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/logopt"
+	"cmd/compile/internal/reflectdata"
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"cmd/internal/obj/s390x"
@@ -14,11 +15,13 @@ import (
 	"cmd/internal/src"
 	"encoding/binary"
 	"fmt"
+	"internal/buildcfg"
 	"io"
 	"math"
 	"math/bits"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type deadValueChoice bool
@@ -235,10 +238,6 @@ func isPtr(t *types.Type) bool {
 	return t.IsPtrShaped()
 }
 
-func isSigned(t *types.Type) bool {
-	return t.IsSigned()
-}
-
 // mergeSym merges two symbolic offsets. There is no real merging of
 // offsets, we just pick the non-nil one.
 func mergeSym(x, y Sym) Sym {
@@ -412,18 +411,18 @@ func canMergeLoad(target, load *Value) bool {
 	return true
 }
 
-// isSameCall reports whether sym is the same as the given named symbol
+// isSameCall reports whether sym is the same as the given named symbol.
 func isSameCall(sym interface{}, name string) bool {
 	fn := sym.(*AuxCall).Fn
 	return fn != nil && fn.String() == name
 }
 
-// canLoadUnaligned reports if the architecture supports unaligned load operations
+// canLoadUnaligned reports if the architecture supports unaligned load operations.
 func canLoadUnaligned(c *Config) bool {
 	return c.ctxt.Arch.Alignment == 1
 }
 
-// nlz returns the number of leading zeros.
+// nlzX returns the number of leading zeros.
 func nlz64(x int64) int { return bits.LeadingZeros64(uint64(x)) }
 func nlz32(x int32) int { return bits.LeadingZeros32(uint32(x)) }
 func nlz16(x int16) int { return bits.LeadingZeros16(uint16(x)) }
@@ -467,7 +466,7 @@ func log2uint32(n int64) int64 {
 	return int64(bits.Len32(uint32(n))) - 1
 }
 
-// isPowerOfTwo functions report whether n is a power of 2.
+// isPowerOfTwoX functions report whether n is a power of 2.
 func isPowerOfTwo8(n int8) bool {
 	return n > 0 && n&(n-1) == 0
 }
@@ -729,6 +728,13 @@ type Aux interface {
 	CanBeAnSSAAux()
 }
 
+// for now only used to mark moves that need to avoid clobbering flags
+type auxMark bool
+
+func (auxMark) CanBeAnSSAAux() {}
+
+var AuxMark auxMark
+
 // stringAux wraps string values for use in Aux.
 type stringAux string
 
@@ -796,25 +802,6 @@ func loadLSymOffset(lsym *obj.LSym, offset int64) *obj.LSym {
 	return nil
 }
 
-// de-virtualize an InterLECall
-// 'sym' is the symbol for the itab
-func devirtLESym(v *Value, aux Aux, sym Sym, offset int64) *obj.LSym {
-	n, ok := sym.(*obj.LSym)
-	if !ok {
-		return nil
-	}
-
-	lsym := loadLSymOffset(n, offset)
-	if f := v.Block.Func; f.pass.debug > 0 {
-		if lsym != nil {
-			f.Warnl(v.Pos, "de-virtualizing call")
-		} else {
-			f.Warnl(v.Pos, "couldn't de-virtualize call")
-		}
-	}
-	return lsym
-}
-
 func devirtLECall(v *Value, sym *obj.LSym) *Value {
 	v.Op = OpStaticLECall
 	auxcall := v.Aux.(*AuxCall)
@@ -824,6 +811,9 @@ func devirtLECall(v *Value, sym *obj.LSym) *Value {
 	copy(v.Args[0:], v.Args[1:])
 	v.Args[len(v.Args)-1] = nil // aid GC
 	v.Args = v.Args[:len(v.Args)-1]
+	if f := v.Block.Func; f.pass.debug > 0 {
+		f.Warnl(v.Pos, "de-virtualizing call")
+	}
 	return v
 }
 
@@ -839,9 +829,7 @@ func isSamePtr(p1, p2 *Value) bool {
 	case OpOffPtr:
 		return p1.AuxInt == p2.AuxInt && isSamePtr(p1.Args[0], p2.Args[0])
 	case OpAddr, OpLocalAddr:
-		// OpAddr's 0th arg is either OpSP or OpSB, which means that it is uniquely identified by its Op.
-		// Checking for value equality only works after [z]cse has run.
-		return p1.Aux == p2.Aux && p1.Args[0].Op == p2.Args[0].Op
+		return p1.Aux == p2.Aux
 	case OpAddPtr:
 		return p1.Args[1] == p2.Args[1] && isSamePtr(p1.Args[0], p2.Args[0])
 	}
@@ -871,6 +859,9 @@ func disjoint(p1 *Value, n1 int64, p2 *Value, n2 int64) bool {
 			offset += base.AuxInt
 			base = base.Args[0]
 		}
+		if opcodeTable[base.Op].nilCheck {
+			base = base.Args[0]
+		}
 		return base, offset
 	}
 	p1, off1 := baseAndOffset(p1)
@@ -898,7 +889,7 @@ func disjoint(p1 *Value, n1 int64, p2 *Value, n2 int64) bool {
 	return false
 }
 
-// moveSize returns the number of bytes an aligned MOV instruction moves
+// moveSize returns the number of bytes an aligned MOV instruction moves.
 func moveSize(align int64, c *Config) int64 {
 	switch {
 	case align%8 == 0 && c.PtrSize == 8:
@@ -1019,7 +1010,7 @@ func warnRule(cond bool, v *Value, s string) bool {
 	return true
 }
 
-// for a pseudo-op like (LessThan x), extract x
+// for a pseudo-op like (LessThan x), extract x.
 func flagArg(v *Value) *Value {
 	if len(v.Args) != 1 || !v.Args[0].Type.IsFlags() {
 		return nil
@@ -1165,7 +1156,7 @@ func ccARM64Eval(op Op, flags *Value) int {
 }
 
 // logRule logs the use of the rule s. This will only be enabled if
-// rewrite rules were generated with the -log option, see gen/rulegen.go.
+// rewrite rules were generated with the -log option, see _gen/rulegen.go.
 func logRule(s string) {
 	if ruleFile == nil {
 		// Open a log file to write log to. We open in append
@@ -1191,6 +1182,12 @@ var ruleFile io.Writer
 
 func min(x, y int64) int64 {
 	if x < y {
+		return x
+	}
+	return y
+}
+func max(x, y int64) int64 {
+	if x > y {
 		return x
 	}
 	return y
@@ -1250,7 +1247,7 @@ func reciprocalExact32(c float32) bool {
 	}
 }
 
-// check if an immediate can be directly encoded into an ARM's instruction
+// check if an immediate can be directly encoded into an ARM's instruction.
 func isARMImmRot(v uint32) bool {
 	for i := 0; i < 16; i++ {
 		if v&^0xff == 0 {
@@ -1293,6 +1290,10 @@ func zeroUpper32Bits(x *Value, depth int) bool {
 		OpAMD64SHRL, OpAMD64SHRLconst, OpAMD64SARL, OpAMD64SARLconst,
 		OpAMD64SHLL, OpAMD64SHLLconst:
 		return true
+	case OpARM64REV16W, OpARM64REVW, OpARM64RBITW, OpARM64CLZW, OpARM64EXTRWconst,
+		OpARM64MULW, OpARM64MNEGW, OpARM64UDIVW, OpARM64DIVW, OpARM64UMODW,
+		OpARM64MADDW, OpARM64MSUBW, OpARM64RORW, OpARM64RORWconst:
+		return true
 	case OpArg:
 		return x.Type.Size() == 4
 	case OpPhi, OpSelect0, OpSelect1:
@@ -1312,7 +1313,7 @@ func zeroUpper32Bits(x *Value, depth int) bool {
 	return false
 }
 
-// zeroUpper48Bits is similar to zeroUpper32Bits, but for upper 48 bits
+// zeroUpper48Bits is similar to zeroUpper32Bits, but for upper 48 bits.
 func zeroUpper48Bits(x *Value, depth int) bool {
 	switch x.Op {
 	case OpAMD64MOVWQZX, OpAMD64MOVWload, OpAMD64MOVWloadidx1, OpAMD64MOVWloadidx2:
@@ -1336,7 +1337,7 @@ func zeroUpper48Bits(x *Value, depth int) bool {
 	return false
 }
 
-// zeroUpper56Bits is similar to zeroUpper32Bits, but for upper 56 bits
+// zeroUpper56Bits is similar to zeroUpper32Bits, but for upper 56 bits.
 func zeroUpper56Bits(x *Value, depth int) bool {
 	switch x.Op {
 	case OpAMD64MOVBQZX, OpAMD64MOVBload, OpAMD64MOVBloadidx1:
@@ -1360,9 +1361,25 @@ func zeroUpper56Bits(x *Value, depth int) bool {
 	return false
 }
 
+func isInlinableMemclr(c *Config, sz int64) bool {
+	if sz < 0 {
+		return false
+	}
+	// TODO: expand this check to allow other architectures
+	// see CL 454255 and issue 56997
+	switch c.arch {
+	case "amd64", "arm64":
+		return true
+	case "ppc64le", "ppc64":
+		return sz < 512
+	}
+	return false
+}
+
 // isInlinableMemmove reports whether the given arch performs a Move of the given size
 // faster than memmove. It will only return true if replacing the memmove with a Move is
-// safe, either because Move is small or because the arguments are disjoint.
+// safe, either because Move will do all of its loads before any of its stores, or
+// because the arguments are known to be disjoint.
 // This is used as a check for replacing memmove with Move ops.
 func isInlinableMemmove(dst, src *Value, sz int64, c *Config) bool {
 	// It is always safe to convert memmove into Move when its arguments are disjoint.
@@ -1381,6 +1398,9 @@ func isInlinableMemmove(dst, src *Value, sz int64, c *Config) bool {
 	}
 	return false
 }
+func IsInlinableMemmove(dst, src *Value, sz int64, c *Config) bool {
+	return isInlinableMemmove(dst, src, sz, c)
+}
 
 // logLargeCopy logs the occurrence of a large copy.
 // The best place to do this is in the rewrite rules where the size of the move is easy to find.
@@ -1394,6 +1414,14 @@ func logLargeCopy(v *Value, s int64) bool {
 	}
 	return true
 }
+func LogLargeCopy(funcName string, pos src.XPos, s int64) {
+	if s < 128 {
+		return
+	}
+	if logopt.Enabled() {
+		logopt.LogOpt(pos, "copy", "lower", funcName, fmt.Sprintf("%d bytes", s))
+	}
+}
 
 // hasSmallRotate reports whether the architecture has rotate instructions
 // for sizes < 32-bit.  This is used to decide whether to promote some rotations.
@@ -1404,6 +1432,12 @@ func hasSmallRotate(c *Config) bool {
 	default:
 		return false
 	}
+}
+
+func supportsPPC64PCRel() bool {
+	// PCRel is currently supported for >= power10, linux only
+	// Internal and external linking supports this on ppc64le; internal linking on ppc64.
+	return buildcfg.GOPPC64 >= 10 && buildcfg.GOOS == "linux"
 }
 
 func newPPC64ShiftAuxInt(sh, mb, me, sz int64) int32 {
@@ -1453,7 +1487,7 @@ func encodePPC64RotateMask(rotate, mask, nbits int64) int64 {
 
 	// Determine boundaries and then decode them
 	if mask == 0 || ^mask == 0 || rotate >= nbits {
-		panic("Invalid PPC64 rotate mask")
+		panic(fmt.Sprintf("invalid PPC64 rotate mask: %x %d %d", uint64(mask), rotate, nbits))
 	} else if nbits == 32 {
 		mb = bits.LeadingZeros32(uint32(mask))
 		me = 32 - bits.TrailingZeros32(uint32(mask))
@@ -1474,7 +1508,26 @@ func encodePPC64RotateMask(rotate, mask, nbits int64) int64 {
 	return int64(me) | int64(mb<<8) | int64(rotate<<16) | int64(nbits<<24)
 }
 
-// The inverse operation of encodePPC64RotateMask.  The values returned as
+// Merge (RLDICL [encoded] (SRDconst [s] x)) into (RLDICL [new_encoded] x)
+// SRDconst on PPC64 is an extended mnemonic of RLDICL. If the input to an
+// RLDICL is an SRDconst, and the RLDICL does not rotate its value, the two
+// operations can be combined. This functions assumes the two opcodes can
+// be merged, and returns an encoded rotate+mask value of the combined RLDICL.
+func mergePPC64RLDICLandSRDconst(encoded, s int64) int64 {
+	mb := s
+	r := 64 - s
+	// A larger mb is a smaller mask.
+	if (encoded>>8)&0xFF < mb {
+		encoded = (encoded &^ 0xFF00) | mb<<8
+	}
+	// The rotate is expected to be 0.
+	if (encoded & 0xFF0000) != 0 {
+		panic("non-zero rotate")
+	}
+	return encoded | r<<16
+}
+
+// DecodePPC64RotateMask is the inverse operation of encodePPC64RotateMask.  The values returned as
 // mb and me satisfy the POWER ISA definition of MASK(x,y) where MASK(mb,me) = mask.
 func DecodePPC64RotateMask(sauxint int64) (rotate, mb, me int64, mask uint64) {
 	auxint := uint64(sauxint)
@@ -1530,7 +1583,7 @@ func mergePPC64AndSrwi(m, s int64) int64 {
 // Return the encoded RLWINM constant, or 0 if they cannot be merged.
 func mergePPC64ClrlsldiSrw(sld, srw int64) int64 {
 	mask_1 := uint64(0xFFFFFFFF >> uint(srw))
-	// for CLRLSLDI, it's more convient to think of it as a mask left bits then rotate left.
+	// for CLRLSLDI, it's more convenient to think of it as a mask left bits then rotate left.
 	mask_2 := uint64(0xFFFFFFFFFFFFFFFF) >> uint(GetPPC64Shiftmb(int64(sld)))
 
 	// Rewrite mask to apply after the final left shift.
@@ -1550,7 +1603,7 @@ func mergePPC64ClrlsldiSrw(sld, srw int64) int64 {
 // the encoded RLWINM constant, or 0 if they cannot be merged.
 func mergePPC64ClrlsldiRlwinm(sld int32, rlw int64) int64 {
 	r_1, _, _, mask_1 := DecodePPC64RotateMask(rlw)
-	// for CLRLSLDI, it's more convient to think of it as a mask left bits then rotate left.
+	// for CLRLSLDI, it's more convenient to think of it as a mask left bits then rotate left.
 	mask_2 := uint64(0xFFFFFFFFFFFFFFFF) >> uint(GetPPC64Shiftmb(int64(sld)))
 
 	// combine the masks, and adjust for the final left shift.
@@ -1575,6 +1628,52 @@ func mergePPC64SldiSrw(sld, srw int64) int64 {
 	mask_l := uint32(0xFFFFFFFF) >> uint(sld)
 	mask := (mask_r & mask_l) << uint(sld)
 	return encodePPC64RotateMask((32-srw+sld)&31, int64(mask), 32)
+}
+
+// Convert a PPC64 opcode from the Op to OpCC form. This converts (op x y)
+// to (Select0 (opCC x y)) without having to explicitly fixup every user
+// of op.
+//
+// E.g consider the case:
+// a = (ADD x y)
+// b = (CMPconst [0] a)
+// c = (OR a z)
+//
+// A rule like (CMPconst [0] (ADD x y)) => (CMPconst [0] (Select0 (ADDCC x y)))
+// would produce:
+// a  = (ADD x y)
+// a' = (ADDCC x y)
+// a” = (Select0 a')
+// b  = (CMPconst [0] a”)
+// c  = (OR a z)
+//
+// which makes it impossible to rewrite the second user. Instead the result
+// of this conversion is:
+// a' = (ADDCC x y)
+// a  = (Select0 a')
+// b  = (CMPconst [0] a)
+// c  = (OR a z)
+//
+// Which makes it trivial to rewrite b using a lowering rule.
+func convertPPC64OpToOpCC(op *Value) *Value {
+	ccOpMap := map[Op]Op{
+		OpPPC64ADD:      OpPPC64ADDCC,
+		OpPPC64ADDconst: OpPPC64ADDCCconst,
+		OpPPC64AND:      OpPPC64ANDCC,
+		OpPPC64ANDN:     OpPPC64ANDNCC,
+		OpPPC64CNTLZD:   OpPPC64CNTLZDCC,
+		OpPPC64OR:       OpPPC64ORCC,
+		OpPPC64SUB:      OpPPC64SUBCC,
+		OpPPC64NEG:      OpPPC64NEGCC,
+		OpPPC64NOR:      OpPPC64NORCC,
+		OpPPC64XOR:      OpPPC64XORCC,
+	}
+	b := op.Block
+	opCC := b.NewValue0I(op.Pos, ccOpMap[op.Op], types.NewTuple(op.Type, types.TypeFlags), op.AuxInt)
+	opCC.AddArgs(op.Args...)
+	op.reset(OpSelect0)
+	op.AddArgs(opCC)
+	return op
 }
 
 // Convenience function to rotate a 32 bit constant value by another constant.
@@ -1613,7 +1712,7 @@ func isARM64BFMask(lsb, mask, rshift int64) bool {
 	return shiftedMask != 0 && isPowerOfTwo64(shiftedMask+1) && nto(shiftedMask)+lsb < 64
 }
 
-// returns the bitfield width of mask >> rshift for arm64 bitfield ops
+// returns the bitfield width of mask >> rshift for arm64 bitfield ops.
 func arm64BFWidth(mask, rshift int64) int64 {
 	shiftedMask := int64(uint64(mask) >> uint64(rshift))
 	if shiftedMask == 0 {
@@ -1632,7 +1731,7 @@ func sizeof(t interface{}) int64 {
 // a register. It assumes float64 values will always fit into registers
 // even if that isn't strictly true.
 func registerizable(b *Block, typ *types.Type) bool {
-	if typ.IsPtrShaped() || typ.IsFloat() {
+	if typ.IsPtrShaped() || typ.IsFloat() || typ.IsBoolean() {
 		return true
 	}
 	if typ.IsInteger() {
@@ -1711,6 +1810,77 @@ func symIsROZero(sym Sym) bool {
 	return true
 }
 
+// isFixed32 returns true if the int32 at offset off in symbol sym
+// is known and constant.
+func isFixed32(c *Config, sym Sym, off int64) bool {
+	return isFixed(c, sym, off, 4)
+}
+
+// isFixed returns true if the range [off,off+size] of the symbol sym
+// is known and constant.
+func isFixed(c *Config, sym Sym, off, size int64) bool {
+	lsym := sym.(*obj.LSym)
+	if lsym.Extra == nil {
+		return false
+	}
+	if _, ok := (*lsym.Extra).(*obj.TypeInfo); ok {
+		if off == 2*c.PtrSize && size == 4 {
+			return true // type hash field
+		}
+	}
+	return false
+}
+func fixed32(c *Config, sym Sym, off int64) int32 {
+	lsym := sym.(*obj.LSym)
+	if ti, ok := (*lsym.Extra).(*obj.TypeInfo); ok {
+		if off == 2*c.PtrSize {
+			return int32(types.TypeHash(ti.Type.(*types.Type)))
+		}
+	}
+	base.Fatalf("fixed32 data not known for %s:%d", sym, off)
+	return 0
+}
+
+// isFixedSym returns true if the contents of sym at the given offset
+// is known and is the constant address of another symbol.
+func isFixedSym(sym Sym, off int64) bool {
+	lsym := sym.(*obj.LSym)
+	switch {
+	case lsym.Type == objabi.SRODATA:
+		// itabs, dictionaries
+	default:
+		return false
+	}
+	for _, r := range lsym.R {
+		if (r.Type == objabi.R_ADDR || r.Type == objabi.R_WEAKADDR) && int64(r.Off) == off && r.Add == 0 {
+			return true
+		}
+	}
+	return false
+}
+func fixedSym(f *Func, sym Sym, off int64) Sym {
+	lsym := sym.(*obj.LSym)
+	for _, r := range lsym.R {
+		if (r.Type == objabi.R_ADDR || r.Type == objabi.R_WEAKADDR) && int64(r.Off) == off {
+			if strings.HasPrefix(r.Sym.Name, "type:") {
+				// In case we're loading a type out of a dictionary, we need to record
+				// that the containing function might put that type in an interface.
+				// That information is currently recorded in relocations in the dictionary,
+				// but if we perform this load at compile time then the dictionary
+				// might be dead.
+				reflectdata.MarkTypeSymUsedInInterface(r.Sym, f.fe.Func().Linksym())
+			} else if strings.HasPrefix(r.Sym.Name, "go:itab") {
+				// Same, but if we're using an itab we need to record that the
+				// itab._type might be put in an interface.
+				reflectdata.MarkTypeSymUsedInInterface(r.Sym, f.fe.Func().Linksym())
+			}
+			return r.Sym
+		}
+	}
+	base.Fatalf("fixedSym data not known for %s:%d", sym, off)
+	return nil
+}
+
 // read8 reads one byte from the read-only global sym at offset off.
 func read8(sym interface{}, off int64) uint8 {
 	lsym := sym.(*obj.LSym)
@@ -1764,6 +1934,9 @@ func read64(sym interface{}, off int64, byteorder binary.ByteOrder) uint64 {
 
 // sequentialAddresses reports true if it can prove that x + n == y
 func sequentialAddresses(x, y *Value, n int64) bool {
+	if x == y && n == 0 {
+		return true
+	}
 	if x.Op == Op386ADDL && y.Op == Op386LEAL1 && y.AuxInt == n && y.Aux == nil &&
 		(x.Args[0] == y.Args[0] && x.Args[1] == y.Args[1] ||
 			x.Args[0] == y.Args[1] && x.Args[1] == y.Args[0]) {
@@ -1957,7 +2130,82 @@ func logicFlags32(x int32) flagConstant {
 }
 
 func makeJumpTableSym(b *Block) *obj.LSym {
-	s := base.Ctxt.Lookup(fmt.Sprintf("%s.jump%d", b.Func.fe.LSym(), b.ID))
+	s := base.Ctxt.Lookup(fmt.Sprintf("%s.jump%d", b.Func.fe.Func().LSym.Name, b.ID))
 	s.Set(obj.AttrDuplicateOK, true)
+	s.Set(obj.AttrLocal, true)
 	return s
+}
+
+// canRotate reports whether the architecture supports
+// rotates of integer registers with the given number of bits.
+func canRotate(c *Config, bits int64) bool {
+	if bits > c.PtrSize*8 {
+		// Don't rewrite to rotates bigger than the machine word.
+		return false
+	}
+	switch c.arch {
+	case "386", "amd64", "arm64":
+		return true
+	case "arm", "s390x", "ppc64", "ppc64le", "wasm", "loong64":
+		return bits >= 32
+	default:
+		return false
+	}
+}
+
+// isARM64bitcon reports whether a constant can be encoded into a logical instruction.
+func isARM64bitcon(x uint64) bool {
+	if x == 1<<64-1 || x == 0 {
+		return false
+	}
+	// determine the period and sign-extend a unit to 64 bits
+	switch {
+	case x != x>>32|x<<32:
+		// period is 64
+		// nothing to do
+	case x != x>>16|x<<48:
+		// period is 32
+		x = uint64(int64(int32(x)))
+	case x != x>>8|x<<56:
+		// period is 16
+		x = uint64(int64(int16(x)))
+	case x != x>>4|x<<60:
+		// period is 8
+		x = uint64(int64(int8(x)))
+	default:
+		// period is 4 or 2, always true
+		// 0001, 0010, 0100, 1000 -- 0001 rotate
+		// 0011, 0110, 1100, 1001 -- 0011 rotate
+		// 0111, 1011, 1101, 1110 -- 0111 rotate
+		// 0101, 1010             -- 01   rotate, repeat
+		return true
+	}
+	return sequenceOfOnes(x) || sequenceOfOnes(^x)
+}
+
+// sequenceOfOnes tests whether a constant is a sequence of ones in binary, with leading and trailing zeros.
+func sequenceOfOnes(x uint64) bool {
+	y := x & -x // lowest set bit of x. x is good iff x+y is a power of 2
+	y += x
+	return (y-1)&y == 0
+}
+
+// isARM64addcon reports whether x can be encoded as the immediate value in an ADD or SUB instruction.
+func isARM64addcon(v int64) bool {
+	/* uimm12 or uimm24? */
+	if v < 0 {
+		return false
+	}
+	if (v & 0xFFF) == 0 {
+		v >>= 12
+	}
+	return v <= 0xFFF
+}
+
+// setPos sets the position of v to pos, then returns true.
+// Useful for setting the result of a rewrite's position to
+// something other than the default.
+func setPos(v *Value, pos src.XPos) bool {
+	v.Pos = pos
+	return true
 }

@@ -5,7 +5,7 @@
 package cipher
 
 import (
-	subtleoverlap "crypto/internal/subtle"
+	"crypto/internal/alias"
 	"crypto/subtle"
 	"encoding/binary"
 	"errors"
@@ -80,8 +80,8 @@ type gcm struct {
 // with the standard nonce length.
 //
 // In general, the GHASH operation performed by this implementation of GCM is not constant-time.
-// An exception is when the underlying Block was created by aes.NewCipher
-// on systems with hardware support for AES. See the crypto/aes package documentation for details.
+// An exception is when the underlying [Block] was created by aes.NewCipher
+// on systems with hardware support for AES. See the [crypto/aes] package documentation for details.
 func NewGCM(cipher Block) (AEAD, error) {
 	return newGCMWithNonceAndTagSize(cipher, gcmStandardNonceSize, gcmTagSize)
 }
@@ -92,7 +92,7 @@ func NewGCM(cipher Block) (AEAD, error) {
 //
 // Only use this function if you require compatibility with an existing
 // cryptosystem that uses non-standard nonce lengths. All other users should use
-// NewGCM, which is faster and more resistant to misuse.
+// [NewGCM], which is faster and more resistant to misuse.
 func NewGCMWithNonceSize(cipher Block, size int) (AEAD, error) {
 	return newGCMWithNonceAndTagSize(cipher, size, gcmTagSize)
 }
@@ -104,7 +104,7 @@ func NewGCMWithNonceSize(cipher Block, size int) (AEAD, error) {
 //
 // Only use this function if you require compatibility with an existing
 // cryptosystem that uses non-standard tag lengths. All other users should use
-// NewGCM, which is more resistant to misuse.
+// [NewGCM], which is more resistant to misuse.
 func NewGCMWithTagSize(cipher Block, tagSize int) (AEAD, error) {
 	return newGCMWithNonceAndTagSize(cipher, gcmStandardNonceSize, tagSize)
 }
@@ -174,7 +174,7 @@ func (g *gcm) Seal(dst, nonce, plaintext, data []byte) []byte {
 	}
 
 	ret, out := sliceForAppend(dst, len(plaintext)+g.tagSize)
-	if subtleoverlap.InexactOverlap(out, plaintext) {
+	if alias.InexactOverlap(out, plaintext) {
 		panic("crypto/cipher: invalid buffer overlap")
 	}
 
@@ -225,7 +225,7 @@ func (g *gcm) Open(dst, nonce, ciphertext, data []byte) ([]byte, error) {
 	g.auth(expectedTag[:], ciphertext, data, &tagMask)
 
 	ret, out := sliceForAppend(dst, len(ciphertext))
-	if subtleoverlap.InexactOverlap(out, ciphertext) {
+	if alias.InexactOverlap(out, ciphertext) {
 		panic("crypto/cipher: invalid buffer overlap")
 	}
 
@@ -373,7 +373,7 @@ func (g *gcm) counterCrypt(out, in []byte, counter *[gcmBlockSize]byte) {
 		g.cipher.Encrypt(mask[:], counter[:])
 		gcmInc32(counter)
 
-		xorWords(out, in, mask[:])
+		subtle.XORBytes(out, in, mask[:])
 		out = out[gcmBlockSize:]
 		in = in[gcmBlockSize:]
 	}
@@ -381,7 +381,7 @@ func (g *gcm) counterCrypt(out, in []byte, counter *[gcmBlockSize]byte) {
 	if len(in) > 0 {
 		g.cipher.Encrypt(mask[:], counter[:])
 		gcmInc32(counter)
-		xorBytes(out, in, mask[:])
+		subtle.XORBytes(out, in, mask[:])
 	}
 }
 
@@ -423,5 +423,5 @@ func (g *gcm) auth(out, ciphertext, additionalData []byte, tagMask *[gcmTagSize]
 	binary.BigEndian.PutUint64(out, y.low)
 	binary.BigEndian.PutUint64(out[8:], y.high)
 
-	xorWords(out, out, tagMask[:])
+	subtle.XORBytes(out, out, tagMask[:])
 }

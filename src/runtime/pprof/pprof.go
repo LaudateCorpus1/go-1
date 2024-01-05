@@ -69,12 +69,11 @@
 // all pprof commands.
 //
 // For more information about pprof, see
-// https://github.com/google/pprof/blob/master/doc/README.md.
+// https://github.com/google/pprof/blob/main/doc/README.md.
 package pprof
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"internal/abi"
 	"io"
@@ -108,7 +107,13 @@ import (
 //	mutex        - stack traces of holders of contended mutexes
 //
 // These predefined profiles maintain themselves and panic on an explicit
-// Add or Remove method call.
+// [Profile.Add] or [Profile.Remove] method call.
+//
+// The CPU profile is not available as a Profile. It has a special API,
+// the [StartCPUProfile] and [StopCPUProfile] functions, because it streams
+// output to a writer during profiling.
+//
+// # Heap profile
 //
 // The heap profile reports statistics as of the most recently completed
 // garbage collection; it elides more recent allocation to avoid skewing
@@ -123,13 +128,47 @@ import (
 // flags select which to display, defaulting to -inuse_space (live objects,
 // scaled by size).
 //
+// # Allocs profile
+//
 // The allocs profile is the same as the heap profile but changes the default
 // pprof display to -alloc_space, the total number of bytes allocated since
 // the program began (including garbage-collected bytes).
 //
-// The CPU profile is not available as a Profile. It has a special API,
-// the StartCPUProfile and StopCPUProfile functions, because it streams
-// output to a writer during profiling.
+// # Block profile
+//
+// The block profile tracks time spent blocked on synchronization primitives,
+// such as [sync.Mutex], [sync.RWMutex], [sync.WaitGroup], [sync.Cond], and
+// channel send/receive/select.
+//
+// Stack traces correspond to the location that blocked (for example,
+// [sync.Mutex.Lock]).
+//
+// Sample values correspond to cumulative time spent blocked at that stack
+// trace, subject to time-based sampling specified by
+// [runtime.SetBlockProfileRate].
+//
+// # Mutex profile
+//
+// The mutex profile tracks contention on mutexes, such as [sync.Mutex],
+// [sync.RWMutex], and runtime-internal locks.
+//
+// Stack traces correspond to the end of the critical section causing
+// contention. For example, a lock held for a long time while other goroutines
+// are waiting to acquire the lock will report contention when the lock is
+// finally unlocked (that is, at [sync.Mutex.Unlock]).
+//
+// Sample values correspond to the approximate cumulative time other goroutines
+// spent blocked waiting for the lock, subject to event-based sampling
+// specified by [runtime.SetMutexProfileFraction]. For example, if a caller
+// holds a lock for 1s while 5 other goroutines are waiting for the entire
+// second to acquire the lock, its unlock call stack will report 5s of
+// contention.
+//
+// Runtime-internal locks are always reported at the location
+// "runtime._LostContendedRuntimeLock". More detailed stack traces for
+// runtime-internal locks can be obtained by setting
+// `GODEBUG=runtimecontentionstacks=1` (see package [runtime] docs for
+// caveats).
 type Profile struct {
 	name  string
 	mu    sync.Mutex
@@ -243,7 +282,7 @@ func Profiles() []*Profile {
 	return all
 }
 
-// Name returns this profile's name, which can be passed to Lookup to reobtain the profile.
+// Name returns this profile's name, which can be passed to [Lookup] to reobtain the profile.
 func (p *Profile) Name() string {
 	return p.name
 }
@@ -261,9 +300,9 @@ func (p *Profile) Count() int {
 // Add adds the current execution stack to the profile, associated with value.
 // Add stores value in an internal map, so value must be suitable for use as
 // a map key and will not be garbage collected until the corresponding
-// call to Remove. Add panics if the profile already contains a stack for value.
+// call to [Profile.Remove]. Add panics if the profile already contains a stack for value.
 //
-// The skip parameter has the same meaning as runtime.Caller's skip
+// The skip parameter has the same meaning as [runtime.Caller]'s skip
 // and controls where the stack trace begins. Passing skip=0 begins the
 // trace in the function calling Add. For example, given this
 // execution stack:
@@ -372,8 +411,7 @@ type countProfile interface {
 // as the pprof-proto format output. Translations from cycle count to time duration
 // are done because The proto expects count and time (nanoseconds) instead of count
 // and the number of cycles for block, contention profiles.
-// Possible 'scaler' functions are scaleBlockProfile and scaleMutexProfile.
-func printCountCycleProfile(w io.Writer, countName, cycleName string, scaler func(int64, float64) (int64, float64), records []runtime.BlockProfileRecord) error {
+func printCountCycleProfile(w io.Writer, countName, cycleName string, records []runtime.BlockProfileRecord) error {
 	// Output profile in protobuf form.
 	b := newProfileBuilder(w)
 	b.pbValueType(tagProfile_PeriodType, countName, "count")
@@ -386,9 +424,8 @@ func printCountCycleProfile(w io.Writer, countName, cycleName string, scaler fun
 	values := []int64{0, 0}
 	var locs []uint64
 	for _, r := range records {
-		count, nanosec := scaler(r.Count, float64(r.Cycles)/cpuGHz)
-		values[0] = count
-		values[1] = int64(nanosec)
+		values[0] = r.Count
+		values[1] = int64(float64(r.Cycles) / cpuGHz)
 		// For count profiles, all stack addresses are
 		// return PCs, which is what appendLocsForStack expects.
 		locs = b.appendLocsForStack(locs[:0], r.Stack())
@@ -402,7 +439,7 @@ func printCountCycleProfile(w io.Writer, countName, cycleName string, scaler fun
 // The profile will be in compressed proto format unless debug is nonzero.
 func printCountProfile(w io.Writer, debug int, name string, p countProfile) error {
 	// Build count of each stack.
-	var buf bytes.Buffer
+	var buf strings.Builder
 	key := func(stk []uintptr, lbls *labelMap) string {
 		buf.Reset()
 		fmt.Fprintf(&buf, "@")
@@ -518,7 +555,7 @@ func printStackRecord(w io.Writer, stk []uintptr, allFrames bool) {
 
 // Interface to system profiles.
 
-// WriteHeapProfile is shorthand for Lookup("heap").WriteTo(w, 0).
+// WriteHeapProfile is shorthand for [Lookup]("heap").WriteTo(w, 0).
 // It is preserved for backwards compatibility.
 func WriteHeapProfile(w io.Writer) error {
 	return writeHeap(w, 0)
@@ -593,10 +630,24 @@ func writeHeapInternal(w io.Writer, debug int, defaultSampleType string) error {
 	// Technically the rate is MemProfileRate not 2*MemProfileRate,
 	// but early versions of the C++ heap profiler reported 2*MemProfileRate,
 	// so that's what pprof has come to expect.
+	rate := 2 * runtime.MemProfileRate
+
+	// pprof reads a profile with alloc == inuse as being a "2-column" profile
+	// (objects and bytes, not distinguishing alloc from inuse),
+	// but then such a profile can't be merged using pprof *.prof with
+	// other 4-column profiles where alloc != inuse.
+	// The easiest way to avoid this bug is to adjust allocBytes so it's never == inuseBytes.
+	// pprof doesn't use these header values anymore except for checking equality.
+	inUseBytes := total.InUseBytes()
+	allocBytes := total.AllocBytes
+	if inUseBytes == allocBytes {
+		allocBytes++
+	}
+
 	fmt.Fprintf(w, "heap profile: %d: %d [%d: %d] @ heap/%d\n",
-		total.InUseObjects(), total.InUseBytes(),
-		total.AllocObjects, total.AllocBytes,
-		2*runtime.MemProfileRate)
+		total.InUseObjects(), inUseBytes,
+		total.AllocObjects, allocBytes,
+		rate)
 
 	for i := range p {
 		r := &p[i]
@@ -754,8 +805,8 @@ var cpu struct {
 // Go code built with -buildmode=c-archive or -buildmode=c-shared.
 // StartCPUProfile relies on the SIGPROF signal, but that signal will
 // be delivered to the main program's SIGPROF signal handler (if any)
-// not to the one used by Go. To make it work, call os/signal.Notify
-// for syscall.SIGPROF, but note that doing so may break any profiling
+// not to the one used by Go. To make it work, call [os/signal.Notify]
+// for [syscall.SIGPROF], but note that doing so may break any profiling
 // being done by the main program.
 func StartCPUProfile(w io.Writer) error {
 	// The runtime routines allow a variable profiling rate,
@@ -842,24 +893,16 @@ func countMutex() int {
 
 // writeBlock writes the current blocking profile to w.
 func writeBlock(w io.Writer, debug int) error {
-	return writeProfileInternal(w, debug, "contention", runtime.BlockProfile, scaleBlockProfile)
-}
-
-func scaleBlockProfile(cnt int64, ns float64) (int64, float64) {
-	// Do nothing.
-	// The current way of block profile sampling makes it
-	// hard to compute the unsampled number. The legacy block
-	// profile parse doesn't attempt to scale or unsample.
-	return cnt, ns
+	return writeProfileInternal(w, debug, "contention", runtime.BlockProfile)
 }
 
 // writeMutex writes the current mutex profile to w.
 func writeMutex(w io.Writer, debug int) error {
-	return writeProfileInternal(w, debug, "mutex", runtime.MutexProfile, scaleMutexProfile)
+	return writeProfileInternal(w, debug, "mutex", runtime.MutexProfile)
 }
 
-// writeProfileInternal writes the current blocking or mutex profile depending on the passed parameters
-func writeProfileInternal(w io.Writer, debug int, name string, runtimeProfile func([]runtime.BlockProfileRecord) (int, bool), scaleProfile func(int64, float64) (int64, float64)) error {
+// writeProfileInternal writes the current blocking or mutex profile depending on the passed parameters.
+func writeProfileInternal(w io.Writer, debug int, name string, runtimeProfile func([]runtime.BlockProfileRecord) (int, bool)) error {
 	var p []runtime.BlockProfileRecord
 	n, ok := runtimeProfile(nil)
 	for {
@@ -874,7 +917,7 @@ func writeProfileInternal(w io.Writer, debug int, name string, runtimeProfile fu
 	sort.Slice(p, func(i, j int) bool { return p[i].Cycles > p[j].Cycles })
 
 	if debug <= 0 {
-		return printCountCycleProfile(w, "contentions", "delay", scaleProfile, p)
+		return printCountCycleProfile(w, "contentions", "delay", p)
 	}
 
 	b := bufio.NewWriter(w)
@@ -902,11 +945,6 @@ func writeProfileInternal(w io.Writer, debug int, name string, runtimeProfile fu
 		tw.Flush()
 	}
 	return b.Flush()
-}
-
-func scaleMutexProfile(cnt int64, ns float64) (int64, float64) {
-	period := runtime.SetMutexProfileFraction(-1)
-	return cnt * int64(period), ns * float64(period)
 }
 
 func runtime_cyclesPerSecond() int64

@@ -126,6 +126,9 @@ func header(arch string) {
 		fmt.Fprintf(out, "//go:build %s || %sle\n\n", base, base)
 	}
 	fmt.Fprintf(out, "#include \"go_asm.h\"\n")
+	if arch == "amd64" {
+		fmt.Fprintf(out, "#include \"asm_amd64.h\"\n")
+	}
 	fmt.Fprintf(out, "#include \"textflag.h\"\n\n")
 	fmt.Fprintf(out, "TEXT ·asyncPreempt(SB),NOSPLIT|NOFRAME,$0-0\n")
 }
@@ -267,8 +270,10 @@ func genAMD64() {
 	// Clear the upper bits to get to a clean state. See issue #37174.
 	// It is safe here as Go code don't use the upper bits of Y registers.
 	p("#ifdef GOOS_darwin")
+	p("#ifndef hasAVX")
 	p("CMPB internal∕cpu·X86+const_offsetX86HasAVX(SB), $0")
 	p("JE 2(PC)")
+	p("#endif")
 	p("VZEROUPPER")
 	p("#endif")
 
@@ -312,11 +317,11 @@ func genARM() {
 
 	p("MOVW.W R14, -%d(R13)", lfp.stack) // allocate frame, save LR
 	l.save()
-	p("MOVB ·goarm(SB), R0\nCMP $6, R0\nBLT nofp") // test goarm, and skip FP registers if goarm=5.
+	p("MOVB ·goarmsoftfp(SB), R0\nCMP $0, R0\nBNE nofp") // test goarmsoftfp, and skip FP registers if goarmsoftfp!=0.
 	lfp.save()
 	label("nofp:")
 	p("CALL ·asyncPreempt2(SB)")
-	p("MOVB ·goarm(SB), R0\nCMP $6, R0\nBLT nofp2") // test goarm, and skip FP registers if goarm=5.
+	p("MOVB ·goarmsoftfp(SB), R0\nCMP $0, R0\nBNE nofp2") // test goarmsoftfp, and skip FP registers if goarmsoftfp!=0.
 	lfp.restore()
 	label("nofp2:")
 	l.restore()
@@ -457,26 +462,30 @@ func genLoong64() {
 	movf := "MOVD"
 	add := "ADDV"
 	sub := "SUBV"
-	r31 := "RSB"
 	regsize := 8
 
 	// Add integer registers r4-r21 r23-r29 r31
 	// R0 (zero), R30 (REGTMP), R2 (tp), R3 (SP), R22 (g), R1 (LR) are special,
 	var l = layout{sp: "R3", stack: regsize} // add slot to save PC of interrupted instruction (in LR)
-	for i := 4; i <= 29; i++ {
-		if i == 22 {
-			continue // R3 is REGSP  R22 is g
+	for i := 4; i <= 31; i++ {
+		if i == 22 || i == 30 {
+			continue
 		}
 		reg := fmt.Sprintf("R%d", i)
 		l.add(mov, reg, regsize)
 	}
-	l.add(mov, r31, regsize)
 
 	// Add floating point registers F0-F31.
 	for i := 0; i <= 31; i++ {
 		reg := fmt.Sprintf("F%d", i)
 		l.add(movf, reg, regsize)
 	}
+
+	// save/restore FCC0
+	l.addSpecial(
+		mov+" FCC0, R4\n"+mov+" R4, %d(R3)",
+		mov+" %d(R3), R4\n"+mov+" R4, FCC0",
+		regsize)
 
 	// allocate frame, save PC of interrupted instruction (in LR)
 	p(mov+" R1, -%d(R3)", l.stack)
@@ -567,7 +576,7 @@ func genRISCV64() {
 	}
 
 	p("MOV X1, -%d(X2)", l.stack)
-	p("ADD $-%d, X2", l.stack)
+	p("SUB $%d, X2", l.stack)
 	l.save()
 	p("CALL ·asyncPreempt2(SB)")
 	l.restore()

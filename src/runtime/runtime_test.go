@@ -18,7 +18,12 @@ import (
 	"unsafe"
 )
 
-var flagQuick = flag.Bool("quick", false, "skip slow tests, for second run in all.bash")
+// flagQuick is set by the -quick option to skip some relatively slow tests.
+// This is used by the cmd/dist test runtime:cpu124.
+// The cmd/dist test passes both -test.short and -quick;
+// there are tests that only check testing.Short, and those tests will
+// not be skipped if only -quick is used.
+var flagQuick = flag.Bool("quick", false, "skip slow tests, for cmd/dist test runtime:cpu124")
 
 func init() {
 	// We're testing the runtime, so make tracebacks show things
@@ -202,8 +207,8 @@ func TestSetPanicOnFault(t *testing.T) {
 //
 //go:nocheckptr
 func testSetPanicOnFault(t *testing.T, addr uintptr, nfault *int) {
-	if GOOS == "js" {
-		t.Skip("js does not support catching faults")
+	if GOOS == "js" || GOOS == "wasip1" {
+		t.Skip(GOOS + " does not support catching faults")
 	}
 
 	defer func() {
@@ -372,7 +377,7 @@ func BenchmarkGoroutineProfile(b *testing.B) {
 				if !ok {
 					b.Fatal("goroutine profile failed")
 				}
-				latencies = append(latencies, time.Now().Sub(start))
+				latencies = append(latencies, time.Since(start))
 			}
 			b.StopTimer()
 

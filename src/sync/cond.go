@@ -53,7 +53,7 @@ func NewCond(l Locker) *Cond {
 // Wait locks c.L before returning. Unlike in other systems,
 // Wait cannot return unless awoken by Broadcast or Signal.
 //
-// Because c.L is not locked when Wait first resumes, the caller
+// Because c.L is not locked while Wait is waiting, the caller
 // typically cannot assume that the condition is true when
 // Wait returns. Instead, the caller should Wait in a loop:
 //
@@ -96,6 +96,10 @@ func (c *Cond) Broadcast() {
 type copyChecker uintptr
 
 func (c *copyChecker) check() {
+	// Check if c has been copied in three steps:
+	// 1. The first comparison is the fast-path. If c has been initialized and not copied, this will return immediately. Otherwise, c is either not initialized, or has been copied.
+	// 2. Ensure c is initialized. If the CAS succeeds, we're done. If it fails, c was either initialized concurrently and we simply lost the race, or c has been copied.
+	// 3. Do step 1 again. Now that c is definitely initialized, if this fails, c was copied.
 	if uintptr(*c) != uintptr(unsafe.Pointer(c)) &&
 		!atomic.CompareAndSwapUintptr((*uintptr)(c), 0, uintptr(unsafe.Pointer(c))) &&
 		uintptr(*c) != uintptr(unsafe.Pointer(c)) {

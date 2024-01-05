@@ -5,7 +5,6 @@
 package net
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +15,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -156,7 +156,7 @@ func TestLookupLocalPTR(t *testing.T) {
 	}
 	expected, err := lookupPTR(addr.String())
 	if err != nil {
-		t.Logf("skipping failed lookup %s test: %s", addr.String(), err)
+		t.Skipf("skipping failed lookup %s test: %s", addr.String(), err)
 	}
 	sort.Strings(expected)
 	sort.Strings(names)
@@ -171,6 +171,14 @@ func TestLookupPTR(t *testing.T) {
 	for _, addr := range lookupTestIPs {
 		names, err := LookupAddr(addr)
 		if err != nil {
+			// The DNSError type stores the error as a string, so it cannot wrap the
+			// original error code and we cannot check for it here. However, we can at
+			// least use its error string to identify the correct localized text for
+			// the error to skip.
+			var DNS_ERROR_RCODE_SERVER_FAILURE syscall.Errno = 9002
+			if strings.HasSuffix(err.Error(), DNS_ERROR_RCODE_SERVER_FAILURE.Error()) {
+				testenv.SkipFlaky(t, 38111)
+			}
 			t.Errorf("failed %s: %s", addr, err)
 		}
 		if len(names) == 0 {
@@ -179,6 +187,7 @@ func TestLookupPTR(t *testing.T) {
 		expected, err := lookupPTR(addr)
 		if err != nil {
 			t.Logf("skipping failed lookup %s test: %s", addr, err)
+			continue
 		}
 		sort.Strings(expected)
 		sort.Strings(names)
@@ -206,8 +215,8 @@ func (s byHost) Less(i, j int) bool { return s[i].Host < s[j].Host }
 func (s byHost) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 func nslookup(qtype, name string) (string, error) {
-	var out bytes.Buffer
-	var err bytes.Buffer
+	var out strings.Builder
+	var err strings.Builder
 	cmd := exec.Command("nslookup", "-querytype="+qtype, name)
 	cmd.Stdout = &out
 	cmd.Stderr = &err

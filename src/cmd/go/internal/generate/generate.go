@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -89,6 +90,11 @@ Go generate sets several variables when it runs the generator:
 		generator, containing the Go toolchain and standard library.
 	$DOLLAR
 		A dollar sign.
+	$PATH
+		The $PATH of the parent process, with $GOROOT/bin
+		placed at the beginning. This causes generators
+		that execute 'go' commands to use the same 'go'
+		as the parent 'go generate' command.
 
 Other than variable substitution and quoted-string evaluation, no
 special processing such as "globbing" is performed on the command
@@ -133,13 +139,20 @@ all further processing for that package.
 
 The generator is run in the package's source directory.
 
-Go generate accepts one specific flag:
+Go generate accepts two specific flags:
 
 	-run=""
 		if non-empty, specifies a regular expression to select
 		directives whose full original source text (excluding
 		any trailing spaces and final newline) matches the
 		expression.
+
+	-skip=""
+		if non-empty, specifies a regular expression to suppress
+		directives whose full original source text (excluding
+		any trailing spaces and final newline) matches the
+		expression. If a directive matches both the -run and
+		the -skip arguments, it is skipped.
 
 It also accepts the standard build flags including -v, -n, and -x.
 The -v flag prints the names of packages and files as they are
@@ -156,17 +169,28 @@ For more about specifying packages, see 'go help packages'.
 var (
 	generateRunFlag string         // generate -run flag
 	generateRunRE   *regexp.Regexp // compiled expression for -run
+
+	generateSkipFlag string         // generate -skip flag
+	generateSkipRE   *regexp.Regexp // compiled expression for -skip
 )
 
 func init() {
 	work.AddBuildFlags(CmdGenerate, work.DefaultBuildFlags)
 	CmdGenerate.Flag.StringVar(&generateRunFlag, "run", "", "")
+	CmdGenerate.Flag.StringVar(&generateSkipFlag, "skip", "", "")
 }
 
 func runGenerate(ctx context.Context, cmd *base.Command, args []string) {
 	if generateRunFlag != "" {
 		var err error
 		generateRunRE, err = regexp.Compile(generateRunFlag)
+		if err != nil {
+			log.Fatalf("generate: %s", err)
+		}
+	}
+	if generateSkipFlag != "" {
+		var err error
+		generateSkipRE, err = regexp.Compile(generateSkipFlag)
 		if err != nil {
 			log.Fatalf("generate: %s", err)
 		}
@@ -186,6 +210,13 @@ func runGenerate(ctx context.Context, cmd *base.Command, args []string) {
 			continue
 		}
 
+		if pkg.Error != nil && len(pkg.InternalAllGoFiles()) == 0 {
+			// A directory only contains a Go package if it has at least
+			// one .go source file, so the fact that there are no files
+			// implies that the package couldn't be found.
+			base.Errorf("%v", pkg.Error)
+		}
+
 		for _, file := range pkg.InternalGoFiles() {
 			if !generate(file) {
 				break
@@ -198,6 +229,7 @@ func runGenerate(ctx context.Context, cmd *base.Command, args []string) {
 			}
 		}
 	}
+	base.ExitIfErrors()
 }
 
 // generate runs the generation directives for a single file.
@@ -291,10 +323,11 @@ func (g *Generator) run() (ok bool) {
 		if !isGoGenerate(buf) {
 			continue
 		}
-		if generateRunFlag != "" {
-			if !generateRunRE.Match(bytes.TrimSpace(buf)) {
-				continue
-			}
+		if generateRunFlag != "" && !generateRunRE.Match(bytes.TrimSpace(buf)) {
+			continue
+		}
+		if generateSkipFlag != "" && generateSkipRE.Match(bytes.TrimSpace(buf)) {
+			continue
 		}
 
 		g.setEnv()
@@ -442,7 +475,7 @@ func (g *Generator) setShorthand(words []string) {
 	if g.commands[command] != nil {
 		g.errorf("command %q multiply defined", command)
 	}
-	g.commands[command] = words[2:len(words):len(words)] // force later append to make copy
+	g.commands[command] = slices.Clip(words[2:])
 }
 
 // exec runs the command specified by the argument. The first word is
@@ -454,7 +487,7 @@ func (g *Generator) exec(words []string) {
 		// intends to use the same 'go' as 'go generate' itself.
 		// Prefer to resolve the binary from GOROOT/bin, and for consistency
 		// prefer to resolve any other commands there too.
-		gorootBinPath, err := exec.LookPath(filepath.Join(cfg.GOROOTbin, path))
+		gorootBinPath, err := cfg.LookPath(filepath.Join(cfg.GOROOTbin, path))
 		if err == nil {
 			path = gorootBinPath
 		}

@@ -6,7 +6,10 @@
 
 package cipher
 
-import "crypto/internal/subtle"
+import (
+	"crypto/internal/alias"
+	"crypto/subtle"
+)
 
 type ofb struct {
 	b       Block
@@ -15,7 +18,7 @@ type ofb struct {
 	outUsed int
 }
 
-// NewOFB returns a Stream that encrypts or decrypts using the block cipher b
+// NewOFB returns a [Stream] that encrypts or decrypts using the block cipher b
 // in output feedback mode. The initialization vector iv's length must be equal
 // to b's block size.
 func NewOFB(b Block, iv []byte) Stream {
@@ -59,14 +62,14 @@ func (x *ofb) XORKeyStream(dst, src []byte) {
 	if len(dst) < len(src) {
 		panic("crypto/cipher: output smaller than input")
 	}
-	if subtle.InexactOverlap(dst[:len(src)], src) {
+	if alias.InexactOverlap(dst[:len(src)], src) {
 		panic("crypto/cipher: invalid buffer overlap")
 	}
 	for len(src) > 0 {
 		if x.outUsed >= len(x.out)-x.b.BlockSize() {
 			x.refill()
 		}
-		n := xorBytes(dst, src, x.out[x.outUsed:])
+		n := subtle.XORBytes(dst, src, x.out[x.outUsed:])
 		dst = dst[n:]
 		src = src[n:]
 		x.outUsed += n

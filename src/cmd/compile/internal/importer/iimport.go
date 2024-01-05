@@ -77,9 +77,7 @@ const (
 	unionType
 )
 
-const io_SeekCurrent = 1 // io.SeekCurrent (not defined in Go 1.4)
-
-// iImportData imports a package from the serialized package data
+// ImportData imports a package from the serialized package data
 // and returns the number of bytes consumed and a reference to the package.
 // If the export data version is not recognized or the format is otherwise
 // compromised, an error is returned.
@@ -108,10 +106,10 @@ func ImportData(imports map[string]*types2.Package, data, path string) (pkg *typ
 	sLen := int64(r.uint64())
 	dLen := int64(r.uint64())
 
-	whence, _ := r.Seek(0, io_SeekCurrent)
+	whence, _ := r.Seek(0, io.SeekCurrent)
 	stringData := data[whence : whence+sLen]
 	declData := data[whence+sLen : whence+sLen+dLen]
-	r.Seek(sLen+dLen, io_SeekCurrent)
+	r.Seek(sLen+dLen, io.SeekCurrent)
 
 	p := iimporter{
 		exportVersion: version,
@@ -139,21 +137,18 @@ func ImportData(imports map[string]*types2.Package, data, path string) (pkg *typ
 		pkgPathOff := r.uint64()
 		pkgPath := p.stringAt(pkgPathOff)
 		pkgName := p.stringAt(r.uint64())
-		pkgHeight := int(r.uint64())
+		_ = int(r.uint64()) // was package height, but not necessary anymore.
 
 		if pkgPath == "" {
 			pkgPath = path
 		}
 		pkg := imports[pkgPath]
 		if pkg == nil {
-			pkg = types2.NewPackageHeight(pkgPath, pkgName, pkgHeight)
+			pkg = types2.NewPackage(pkgPath, pkgName)
 			imports[pkgPath] = pkg
 		} else {
 			if pkg.Name() != pkgName {
 				errorf("conflicting names %s and %s for package %q", pkg.Name(), pkgName, path)
-			}
-			if pkg.Height() != pkgHeight {
-				errorf("conflicting heights %v and %v for package %q", pkg.Height(), pkgHeight, path)
 			}
 		}
 
@@ -236,10 +231,7 @@ func (p *iimporter) doDecl(pkg *types2.Package, name string) {
 	}
 
 	r := &importReader{p: p, currPkg: pkg}
-	// Reader.Reset is not available in Go 1.4.
-	// Use bytes.NewReader for now.
-	// r.declReader.Reset(p.declData[off:])
-	r.declReader = *strings.NewReader(p.declData[off:])
+	r.declReader.Reset(p.declData[off:])
 
 	r.obj(name)
 }
@@ -285,10 +277,7 @@ func (p *iimporter) typAt(off uint64, base *types2.Named) types2.Type {
 	}
 
 	r := &importReader{p: p}
-	// Reader.Reset is not available in Go 1.4.
-	// Use bytes.NewReader for now.
-	// r.declReader.Reset(p.declData[off-predeclReserved:])
-	r.declReader = *strings.NewReader(p.declData[off-predeclReserved:])
+	r.declReader.Reset(p.declData[off-predeclReserved:])
 	t := r.doType(base)
 
 	if canReuse(base, t) {

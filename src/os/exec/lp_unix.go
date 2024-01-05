@@ -8,10 +8,12 @@ package exec
 
 import (
 	"errors"
+	"internal/syscall/unix"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // ErrNotFound is the error resulting if a path search failed to find an executable file.
@@ -22,7 +24,18 @@ func findExecutable(file string) error {
 	if err != nil {
 		return err
 	}
-	if m := d.Mode(); !m.IsDir() && m&0111 != 0 {
+	m := d.Mode()
+	if m.IsDir() {
+		return syscall.EISDIR
+	}
+	err = unix.Eaccess(file, unix.X_OK)
+	// ENOSYS means Eaccess is not available or not implemented.
+	// EPERM can be returned by Linux containers employing seccomp.
+	// In both cases, fall back to checking the permission bits.
+	if err == nil || (err != syscall.ENOSYS && err != syscall.EPERM) {
+		return err
+	}
+	if m&0111 != 0 {
 		return nil
 	}
 	return fs.ErrPermission
@@ -57,10 +70,19 @@ func LookPath(file string) (string, error) {
 		path := filepath.Join(dir, file)
 		if err := findExecutable(path); err == nil {
 			if !filepath.IsAbs(path) {
-				return path, &Error{file, ErrDot}
+				if execerrdot.Value() != "0" {
+					return path, &Error{file, ErrDot}
+				}
+				execerrdot.IncNonDefault()
 			}
 			return path, nil
 		}
 	}
 	return "", &Error{file, ErrNotFound}
+}
+
+// lookExtensions is a no-op on non-Windows platforms, since
+// they do not restrict executables to specific extensions.
+func lookExtensions(path, dir string) (string, error) {
+	return path, nil
 }

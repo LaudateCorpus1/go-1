@@ -8,7 +8,7 @@ package aes
 
 import (
 	"crypto/cipher"
-	subtleoverlap "crypto/internal/subtle"
+	"crypto/internal/alias"
 	"crypto/subtle"
 	"errors"
 )
@@ -43,7 +43,7 @@ var errOpen = errors.New("cipher: message authentication failed")
 var _ gcmAble = (*aesCipherGCM)(nil)
 
 // NewGCM returns the AES cipher wrapped in Galois Counter Mode. This is only
-// called by crypto/cipher.NewGCM via the gcmAble interface.
+// called by [crypto/cipher.NewGCM] via the gcmAble interface.
 func (c *aesCipherGCM) NewGCM(nonceSize, tagSize int) (cipher.AEAD, error) {
 	g := &gcmAsm{ks: c.enc, nonceSize: nonceSize, tagSize: tagSize}
 	gcmAesInit(&g.productTable, g.ks)
@@ -86,7 +86,7 @@ func sliceForAppend(in []byte, n int) (head, tail []byte) {
 	return
 }
 
-// Seal encrypts and authenticates plaintext. See the cipher.AEAD interface for
+// Seal encrypts and authenticates plaintext. See the [cipher.AEAD] interface for
 // details.
 func (g *gcmAsm) Seal(dst, nonce, plaintext, data []byte) []byte {
 	if len(nonce) != g.nonceSize {
@@ -114,7 +114,7 @@ func (g *gcmAsm) Seal(dst, nonce, plaintext, data []byte) []byte {
 	gcmAesData(&g.productTable, data, &tagOut)
 
 	ret, out := sliceForAppend(dst, len(plaintext)+g.tagSize)
-	if subtleoverlap.InexactOverlap(out[:len(plaintext)], plaintext) {
+	if alias.InexactOverlap(out[:len(plaintext)], plaintext) {
 		panic("crypto/cipher: invalid buffer overlap")
 	}
 	if len(plaintext) > 0 {
@@ -126,7 +126,7 @@ func (g *gcmAsm) Seal(dst, nonce, plaintext, data []byte) []byte {
 	return ret
 }
 
-// Open authenticates and decrypts ciphertext. See the cipher.AEAD interface
+// Open authenticates and decrypts ciphertext. See the [cipher.AEAD] interface
 // for details.
 func (g *gcmAsm) Open(dst, nonce, ciphertext, data []byte) ([]byte, error) {
 	if len(nonce) != g.nonceSize {
@@ -167,7 +167,7 @@ func (g *gcmAsm) Open(dst, nonce, ciphertext, data []byte) ([]byte, error) {
 	gcmAesData(&g.productTable, data, &expectedTag)
 
 	ret, out := sliceForAppend(dst, len(ciphertext))
-	if subtleoverlap.InexactOverlap(out, ciphertext) {
+	if alias.InexactOverlap(out, ciphertext) {
 		panic("crypto/cipher: invalid buffer overlap")
 	}
 	if len(ciphertext) > 0 {

@@ -72,7 +72,7 @@ func (m *argMatcher) match(typ types.Type, topLevel bool) bool {
 		return true
 	}
 
-	if typ, _ := typ.(*typeparams.TypeParam); typ != nil {
+	if typ, _ := typ.(*types.TypeParam); typ != nil {
 		// Avoid infinite recursion through type parameters.
 		if m.seen[typ] {
 			return true
@@ -298,14 +298,4 @@ func isConvertibleToString(typ types.Type) bool {
 	}
 
 	return false
-}
-
-// hasBasicType reports whether x's type is a types.Basic with the given kind.
-func hasBasicType(pass *analysis.Pass, x ast.Expr, kind types.BasicKind) bool {
-	t := pass.TypesInfo.Types[x].Type
-	if t != nil {
-		t = t.Underlying()
-	}
-	b, ok := t.(*types.Basic)
-	return ok && b.Kind() == kind
 }

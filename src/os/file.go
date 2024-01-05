@@ -42,8 +42,8 @@ package os
 import (
 	"errors"
 	"internal/poll"
+	"internal/safefilepath"
 	"internal/testlog"
-	"internal/unsafeheader"
 	"io"
 	"io/fs"
 	"runtime"
@@ -157,12 +157,26 @@ func (f *File) ReadFrom(r io.Reader) (n int64, err error) {
 	return n, f.wrapErr("write", e)
 }
 
-func genericReadFrom(f *File, r io.Reader) (int64, error) {
-	return io.Copy(onlyWriter{f}, r)
+// noReadFrom can be embedded alongside another type to
+// hide the ReadFrom method of that other type.
+type noReadFrom struct{}
+
+// ReadFrom hides another ReadFrom method.
+// It should never be called.
+func (noReadFrom) ReadFrom(io.Reader) (int64, error) {
+	panic("can't happen")
 }
 
-type onlyWriter struct {
-	io.Writer
+// fileWithoutReadFrom implements all the methods of *File other
+// than ReadFrom. This is used to permit ReadFrom to call io.Copy
+// without leading to a recursive call to ReadFrom.
+type fileWithoutReadFrom struct {
+	noReadFrom
+	*File
+}
+
+func genericReadFrom(f *File, r io.Reader) (int64, error) {
+	return io.Copy(fileWithoutReadFrom{File: f}, r)
 }
 
 // Write writes len(b) bytes from b to the File.
@@ -221,15 +235,45 @@ func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
 	return
 }
 
+// WriteTo implements io.WriterTo.
+func (f *File) WriteTo(w io.Writer) (n int64, err error) {
+	if err := f.checkValid("read"); err != nil {
+		return 0, err
+	}
+	n, handled, e := f.writeTo(w)
+	if handled {
+		return n, f.wrapErr("read", e)
+	}
+	return genericWriteTo(f, w) // without wrapping
+}
+
+// noWriteTo can be embedded alongside another type to
+// hide the WriteTo method of that other type.
+type noWriteTo struct{}
+
+// WriteTo hides another WriteTo method.
+// It should never be called.
+func (noWriteTo) WriteTo(io.Writer) (int64, error) {
+	panic("can't happen")
+}
+
+// fileWithoutWriteTo implements all the methods of *File other
+// than WriteTo. This is used to permit WriteTo to call io.Copy
+// without leading to a recursive call to WriteTo.
+type fileWithoutWriteTo struct {
+	noWriteTo
+	*File
+}
+
+func genericWriteTo(f *File, w io.Writer) (int64, error) {
+	return io.Copy(w, fileWithoutWriteTo{File: f})
+}
+
 // Seek sets the offset for the next Read or Write on file to offset, interpreted
 // according to whence: 0 means relative to the origin of the file, 1 means
 // relative to the current offset, and 2 means relative to the end.
 // It returns the new offset and an error, if any.
 // The behavior of Seek on a file opened with O_APPEND is not specified.
-//
-// If f is a directory, the behavior of Seek varies by operating
-// system; you can seek to the beginning of the directory on Unix-like
-// operating systems, but not on Windows.
 func (f *File) Seek(offset int64, whence int) (ret int64, err error) {
 	if err := f.checkValid("seek"); err != nil {
 		return 0, err
@@ -247,11 +291,7 @@ func (f *File) Seek(offset int64, whence int) (ret int64, err error) {
 // WriteString is like Write, but writes the contents of string s rather than
 // a slice of bytes.
 func (f *File) WriteString(s string) (n int, err error) {
-	var b []byte
-	hdr := (*unsafeheader.Slice)(unsafe.Pointer(&b))
-	hdr.Data = (*unsafeheader.String)(unsafe.Pointer(&s)).Data
-	hdr.Cap = len(s)
-	hdr.Len = len(s)
+	b := unsafe.Slice(unsafe.StringData(s), len(s))
 	return f.Write(b)
 }
 
@@ -259,9 +299,6 @@ func (f *File) WriteString(s string) (n int, err error) {
 // bits (before umask).
 // If there is an error, it will be of type *PathError.
 func Mkdir(name string, perm FileMode) error {
-	if runtime.GOOS == "windows" && isWindowsNulName(name) {
-		return &PathError{Op: "mkdir", Path: name, Err: syscall.ENOTDIR}
-	}
 	longName := fixLongPath(name)
 	e := ignoringEINTR(func() error {
 		return syscall.Mkdir(longName, syscallMode(perm))
@@ -349,9 +386,19 @@ var lstat = Lstat
 // Rename renames (moves) oldpath to newpath.
 // If newpath already exists and is not a directory, Rename replaces it.
 // OS-specific restrictions may apply when oldpath and newpath are in different directories.
+// Even within the same directory, on non-Unix platforms Rename is not an atomic operation.
 // If there is an error, it will be of type *LinkError.
 func Rename(oldpath, newpath string) error {
 	return rename(oldpath, newpath)
+}
+
+// Readlink returns the destination of the named symbolic link.
+// If there is an error, it will be of type *PathError.
+//
+// If the link destination is relative, Readlink returns the relative path
+// without resolving it to an absolute one.
+func Readlink(name string) (string, error) {
+	return readlink(name)
 }
 
 // Many functions in package syscall return a count of -1 instead of 0.
@@ -363,6 +410,10 @@ func fixCount(n int, err error) (int, error) {
 	return n, err
 }
 
+// checkWrapErr is the test hook to enable checking unexpected wrapped errors of poll.ErrFileClosing.
+// It is set to true in the export_test.go for tests (including fuzz tests).
+var checkWrapErr = false
+
 // wrapErr wraps an error that occurred during an operation on an open file.
 // It passes io.EOF through unchanged, otherwise converts
 // poll.ErrFileClosing to ErrClosed and wraps the error in a PathError.
@@ -372,6 +423,8 @@ func (f *File) wrapErr(op string, err error) error {
 	}
 	if err == poll.ErrFileClosing {
 		err = ErrClosed
+	} else if checkWrapErr && errors.Is(err, poll.ErrFileClosing) {
+		panic("unexpected error wrapping poll.ErrFileClosing: " + err.Error())
 	}
 	return &PathError{Op: op, Path: f.name, Err: err}
 }
@@ -496,6 +549,9 @@ func UserConfigDir() (string, error) {
 // On Unix, including macOS, it returns the $HOME environment variable.
 // On Windows, it returns %USERPROFILE%.
 // On Plan 9, it returns the $home environment variable.
+//
+// If the expected variable is not set in the environment, UserHomeDir
+// returns either a platform-specific default value or a non-nil error.
 func UserHomeDir() (string, error) {
 	env, enverr := "HOME", "$HOME"
 	switch runtime.GOOS {
@@ -596,24 +652,6 @@ func (f *File) SyscallConn() (syscall.RawConn, error) {
 	return newRawConn(f)
 }
 
-// isWindowsNulName reports whether name is os.DevNull ('NUL') on Windows.
-// True is returned if name is 'NUL' whatever the case.
-func isWindowsNulName(name string) bool {
-	if len(name) != 3 {
-		return false
-	}
-	if name[0] != 'n' && name[0] != 'N' {
-		return false
-	}
-	if name[1] != 'u' && name[1] != 'U' {
-		return false
-	}
-	if name[2] != 'l' && name[2] != 'L' {
-		return false
-	}
-	return true
-}
-
 // DirFS returns a file system (an fs.FS) for the tree of files rooted at the directory dir.
 //
 // Note that DirFS("/prefix") only guarantees that the Open calls it makes to the
@@ -625,44 +663,101 @@ func isWindowsNulName(name string) bool {
 // a general substitute for a chroot-style security mechanism when the directory tree
 // contains arbitrary content.
 //
-// The result implements fs.StatFS.
+// The directory dir must not be "".
+//
+// The result implements [io/fs.StatFS], [io/fs.ReadFileFS] and
+// [io/fs.ReadDirFS].
 func DirFS(dir string) fs.FS {
 	return dirFS(dir)
-}
-
-func containsAny(s, chars string) bool {
-	for i := 0; i < len(s); i++ {
-		for j := 0; j < len(chars); j++ {
-			if s[i] == chars[j] {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 type dirFS string
 
 func (dir dirFS) Open(name string) (fs.File, error) {
-	if !fs.ValidPath(name) || runtime.GOOS == "windows" && containsAny(name, `\:`) {
-		return nil, &PathError{Op: "open", Path: name, Err: ErrInvalid}
-	}
-	f, err := Open(string(dir) + "/" + name)
+	fullname, err := dir.join(name)
 	if err != nil {
-		return nil, err // nil fs.File
+		return nil, &PathError{Op: "open", Path: name, Err: err}
+	}
+	f, err := Open(fullname)
+	if err != nil {
+		// DirFS takes a string appropriate for GOOS,
+		// while the name argument here is always slash separated.
+		// dir.join will have mixed the two; undo that for
+		// error reporting.
+		err.(*PathError).Path = name
+		return nil, err
 	}
 	return f, nil
 }
 
-func (dir dirFS) Stat(name string) (fs.FileInfo, error) {
-	if !fs.ValidPath(name) || runtime.GOOS == "windows" && containsAny(name, `\:`) {
-		return nil, &PathError{Op: "stat", Path: name, Err: ErrInvalid}
-	}
-	f, err := Stat(string(dir) + "/" + name)
+// The ReadFile method calls the [ReadFile] function for the file
+// with the given name in the directory. The function provides
+// robust handling for small files and special file systems.
+// Through this method, dirFS implements [io/fs.ReadFileFS].
+func (dir dirFS) ReadFile(name string) ([]byte, error) {
+	fullname, err := dir.join(name)
 	if err != nil {
+		return nil, &PathError{Op: "readfile", Path: name, Err: err}
+	}
+	b, err := ReadFile(fullname)
+	if err != nil {
+		if e, ok := err.(*PathError); ok {
+			// See comment in dirFS.Open.
+			e.Path = name
+		}
+		return nil, err
+	}
+	return b, nil
+}
+
+// ReadDir reads the named directory, returning all its directory entries sorted
+// by filename. Through this method, dirFS implements [io/fs.ReadDirFS].
+func (dir dirFS) ReadDir(name string) ([]DirEntry, error) {
+	fullname, err := dir.join(name)
+	if err != nil {
+		return nil, &PathError{Op: "readdir", Path: name, Err: err}
+	}
+	entries, err := ReadDir(fullname)
+	if err != nil {
+		if e, ok := err.(*PathError); ok {
+			// See comment in dirFS.Open.
+			e.Path = name
+		}
+		return nil, err
+	}
+	return entries, nil
+}
+
+func (dir dirFS) Stat(name string) (fs.FileInfo, error) {
+	fullname, err := dir.join(name)
+	if err != nil {
+		return nil, &PathError{Op: "stat", Path: name, Err: err}
+	}
+	f, err := Stat(fullname)
+	if err != nil {
+		// See comment in dirFS.Open.
+		err.(*PathError).Path = name
 		return nil, err
 	}
 	return f, nil
+}
+
+// join returns the path for name in dir.
+func (dir dirFS) join(name string) (string, error) {
+	if dir == "" {
+		return "", errors.New("os: DirFS with empty root")
+	}
+	if !fs.ValidPath(name) {
+		return "", ErrInvalid
+	}
+	name, err := safefilepath.FromFS(name)
+	if err != nil {
+		return "", ErrInvalid
+	}
+	if IsPathSeparator(dir[len(dir)-1]) {
+		return string(dir) + name, nil
+	}
+	return string(dir) + string(PathSeparator) + name, nil
 }
 
 // ReadFile reads the named file and returns the contents.
@@ -695,10 +790,6 @@ func ReadFile(name string) ([]byte, error) {
 
 	data := make([]byte, 0, size)
 	for {
-		if len(data) >= cap(data) {
-			d := append(data[:cap(data)], 0)
-			data = d[:len(data)]
-		}
 		n, err := f.Read(data[len(data):cap(data)])
 		data = data[:len(data)+n]
 		if err != nil {
@@ -707,12 +798,19 @@ func ReadFile(name string) ([]byte, error) {
 			}
 			return data, err
 		}
+
+		if len(data) >= cap(data) {
+			d := append(data[:cap(data)], 0)
+			data = d[:len(data)]
+		}
 	}
 }
 
 // WriteFile writes data to the named file, creating it if necessary.
 // If the file does not exist, WriteFile creates it with permissions perm (before umask);
 // otherwise WriteFile truncates it before writing, without changing permissions.
+// Since WriteFile requires multiple system calls to complete, a failure mid-operation
+// can leave the file in a partially written state.
 func WriteFile(name string, data []byte, perm FileMode) error {
 	f, err := OpenFile(name, O_WRONLY|O_CREATE|O_TRUNC, perm)
 	if err != nil {

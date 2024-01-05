@@ -35,7 +35,7 @@ var ErrBadPattern = errors.New("syntax error in pattern")
 //		lo '-' hi   matches character c for lo <= c <= hi
 //
 // Match requires pattern to match all of name, not just a substring.
-// The only possible returned error is ErrBadPattern, when pattern
+// The only possible returned error is [ErrBadPattern], when pattern
 // is malformed.
 //
 // On Windows, escaping is disabled. Instead, '\\' is treated as
@@ -233,13 +233,23 @@ func getEsc(chunk string) (r rune, nchunk string, err error) {
 
 // Glob returns the names of all files matching pattern or nil
 // if there is no matching file. The syntax of patterns is the same
-// as in Match. The pattern may describe hierarchical names such as
-// /usr/*/bin/ed (assuming the Separator is '/').
+// as in [Match]. The pattern may describe hierarchical names such as
+// /usr/*/bin/ed (assuming the [Separator] is '/').
 //
 // Glob ignores file system errors such as I/O errors reading directories.
-// The only possible returned error is ErrBadPattern, when pattern
+// The only possible returned error is [ErrBadPattern], when pattern
 // is malformed.
 func Glob(pattern string) (matches []string, err error) {
+	return globWithLimit(pattern, 0)
+}
+
+func globWithLimit(pattern string, depth int) (matches []string, err error) {
+	// This limit is used prevent stack exhaustion issues. See CVE-2022-30632.
+	const pathSeparatorsLimit = 10000
+	if depth == pathSeparatorsLimit {
+		return nil, ErrBadPattern
+	}
+
 	// Check pattern is well-formed.
 	if _, err := Match(pattern, ""); err != nil {
 		return nil, err
@@ -269,7 +279,7 @@ func Glob(pattern string) (matches []string, err error) {
 	}
 
 	var m []string
-	m, err = Glob(dir)
+	m, err = globWithLimit(dir, depth+1)
 	if err != nil {
 		return
 	}

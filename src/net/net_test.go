@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !js
-
 package net
 
 import (
@@ -97,6 +95,17 @@ func TestCloseWrite(t *testing.T) {
 					t.Error(err)
 					return
 				}
+
+				// Workaround for https://go.dev/issue/49352.
+				// On arm64 macOS (current as of macOS 12.4),
+				// reading from a socket at the same time as the client
+				// is closing it occasionally hangs for 60 seconds before
+				// returning ECONNRESET. Sleep for a bit to give the
+				// socket time to close before trying to read from it.
+				if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+					time.Sleep(10 * time.Millisecond)
+				}
+
 				if !deadline.IsZero() {
 					c.SetDeadline(deadline)
 				}
@@ -372,8 +381,16 @@ func TestZeroByteRead(t *testing.T) {
 
 			ln := newLocalListener(t, network)
 			connc := make(chan Conn, 1)
+			defer func() {
+				ln.Close()
+				for c := range connc {
+					if c != nil {
+						c.Close()
+					}
+				}
+			}()
 			go func() {
-				defer ln.Close()
+				defer close(connc)
 				c, err := ln.Accept()
 				if err != nil {
 					t.Error(err)
@@ -419,6 +436,7 @@ func TestZeroByteRead(t *testing.T) {
 // runs peer1 and peer2 concurrently. withTCPConnPair returns when
 // both have completed.
 func withTCPConnPair(t *testing.T, peer1, peer2 func(c *TCPConn) error) {
+	t.Helper()
 	ln := newLocalListener(t, "tcp")
 	defer ln.Close()
 	errc := make(chan error, 2)
@@ -428,8 +446,9 @@ func withTCPConnPair(t *testing.T, peer1, peer2 func(c *TCPConn) error) {
 			errc <- err
 			return
 		}
-		defer c1.Close()
-		errc <- peer1(c1.(*TCPConn))
+		err = peer1(c1.(*TCPConn))
+		c1.Close()
+		errc <- err
 	}()
 	go func() {
 		c2, err := Dial("tcp", ln.Addr().String())
@@ -437,12 +456,13 @@ func withTCPConnPair(t *testing.T, peer1, peer2 func(c *TCPConn) error) {
 			errc <- err
 			return
 		}
-		defer c2.Close()
-		errc <- peer2(c2.(*TCPConn))
+		err = peer2(c2.(*TCPConn))
+		c2.Close()
+		errc <- err
 	}()
 	for i := 0; i < 2; i++ {
 		if err := <-errc; err != nil {
-			t.Fatal(err)
+			t.Error(err)
 		}
 	}
 }

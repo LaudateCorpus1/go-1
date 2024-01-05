@@ -6,7 +6,7 @@ package aes
 
 import (
 	"crypto/cipher"
-	"crypto/internal/subtle"
+	"crypto/internal/alias"
 	"encoding/binary"
 )
 
@@ -32,7 +32,7 @@ type aesctr struct {
 }
 
 // NewCTR returns a Stream which encrypts/decrypts using the AES block
-// cipher in counter mode. The length of iv must be the same as BlockSize.
+// cipher in counter mode. The length of iv must be the same as [BlockSize].
 func (c *aesCipherAsm) NewCTR(iv []byte) cipher.Stream {
 	if len(iv) != BlockSize {
 		panic("cipher.NewCTR: IV length must equal block size")
@@ -69,7 +69,7 @@ func (c *aesctr) XORKeyStream(dst, src []byte) {
 	if len(dst) < len(src) {
 		panic("crypto/cipher: output smaller than input")
 	}
-	if subtle.InexactOverlap(dst[:len(src)], src) {
+	if alias.InexactOverlap(dst[:len(src)], src) {
 		panic("crypto/cipher: invalid buffer overlap")
 	}
 	for len(src) > 0 {

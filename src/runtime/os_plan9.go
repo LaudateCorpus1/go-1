@@ -69,19 +69,14 @@ func errstr() string
 
 type _Plink uintptr
 
-//go:linkname os_sigpipe os.sigpipe
-func os_sigpipe() {
-	throw("too many writes on closed pipe")
-}
-
 func sigpanic() {
-	g := getg()
-	if !canpanic(g) {
+	gp := getg()
+	if !canpanic() {
 		throw("unexpected signal during runtime execution")
 	}
 
-	note := gostringnocopy((*byte)(unsafe.Pointer(g.m.notesig)))
-	switch g.sig {
+	note := gostringnocopy((*byte)(unsafe.Pointer(gp.m.notesig)))
+	switch gp.sig {
 	case _SIGRFAULT, _SIGWFAULT:
 		i := indexNoFloat(note, "addr=")
 		if i >= 0 {
@@ -92,17 +87,24 @@ func sigpanic() {
 			panicmem()
 		}
 		addr := note[i:]
-		g.sigcode1 = uintptr(atolwhex(addr))
-		if g.sigcode1 < 0x1000 {
+		gp.sigcode1 = uintptr(atolwhex(addr))
+		if gp.sigcode1 < 0x1000 {
 			panicmem()
 		}
-		if g.paniconfault {
-			panicmemAddr(g.sigcode1)
+		if gp.paniconfault {
+			panicmemAddr(gp.sigcode1)
 		}
-		print("unexpected fault address ", hex(g.sigcode1), "\n")
+		if inUserArenaChunk(gp.sigcode1) {
+			// We could check that the arena chunk is explicitly set to fault,
+			// but the fact that we faulted on accessing it is enough to prove
+			// that it is.
+			print("accessed data from freed user arena ", hex(gp.sigcode1), "\n")
+		} else {
+			print("unexpected fault address ", hex(gp.sigcode1), "\n")
+		}
 		throw("fault")
 	case _SIGTRAP:
-		if g.paniconfault {
+		if gp.paniconfault {
 			panicmem()
 		}
 		throw(note)
@@ -312,9 +314,9 @@ func getpid() uint64 {
 }
 
 func osinit() {
+	physPageSize = getPageSize()
 	initBloc()
 	ncpu = getproccount()
-	physPageSize = getPageSize()
 	getg().m.procid = getpid()
 }
 
@@ -325,24 +327,8 @@ func crash() {
 }
 
 //go:nosplit
-func getRandomData(r []byte) {
-	// inspired by wyrand see hash32.go for detail
-	t := nanotime()
-	v := getg().m.procid ^ uint64(t)
-
-	for len(r) > 0 {
-		v ^= 0xa0761d6478bd642f
-		v *= 0xe7037ed1a0b428db
-		size := 8
-		if len(r) < 8 {
-			size = len(r)
-		}
-		for i := 0; i < size; i++ {
-			r[i] = byte(v >> (8 * i))
-		}
-		r = r[size:]
-		v = v>>32 | v<<32
-	}
+func readRandom(r []byte) int {
+	return 0
 }
 
 func initsig(preinit bool) {
@@ -439,7 +425,7 @@ func exit(e int32) {
 		var tmp [32]byte
 		sl := itoa(tmp[:len(tmp)-1], uint64(e))
 		// Don't append, rely on the existing data being zero.
-		status = tmp[:len(sl)+1]
+		status = sl[:len(sl)+1]
 	}
 	goexitsall(&status[0])
 	exits(&status[0])
@@ -461,7 +447,7 @@ func newosproc(mp *m) {
 	}
 }
 
-func exitThread(wait *uint32) {
+func exitThread(wait *atomic.Uint32) {
 	// We should never reach exitThread on Plan 9 because we let
 	// the OS clean up threads.
 	throw("exitThread")
@@ -473,19 +459,19 @@ func semacreate(mp *m) {
 
 //go:nosplit
 func semasleep(ns int64) int {
-	_g_ := getg()
+	gp := getg()
 	if ns >= 0 {
 		ms := timediv(ns, 1000000, nil)
 		if ms == 0 {
 			ms = 1
 		}
-		ret := plan9_tsemacquire(&_g_.m.waitsemacount, ms)
+		ret := plan9_tsemacquire(&gp.m.waitsemacount, ms)
 		if ret == 1 {
 			return 0 // success
 		}
 		return -1 // timeout or interrupted
 	}
-	for plan9_semacquire(&_g_.m.waitsemacount, 1) < 0 {
+	for plan9_semacquire(&gp.m.waitsemacount, 1) < 0 {
 		// interrupted; try again (c.f. lock_sema.go)
 	}
 	return 0 // success

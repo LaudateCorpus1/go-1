@@ -35,7 +35,7 @@ type Example struct {
 // Examples returns the examples found in testFiles, sorted by Name field.
 // The Order fields record the order in which the examples were encountered.
 // The Suffix field is not populated when Examples is called directly, it is
-// only populated by NewFromFiles for examples it finds in _test.go files.
+// only populated by [NewFromFiles] for examples it finds in _test.go files.
 //
 // Playable Examples must be in a package whose name ends in "_test".
 // An Example is "playable" (the Play field is non-nil) in either of these
@@ -112,7 +112,7 @@ func Examples(testFiles ...*ast.File) []*Example {
 
 var outputPrefix = lazyregexp.New(`(?i)^[[:space:]]*(unordered )?output:`)
 
-// Extracts the expected output and whether there was a valid output comment
+// Extracts the expected output and whether there was a valid output comment.
 func exampleOutput(b *ast.BlockStmt, comments []*ast.CommentGroup) (output string, unordered, ok bool) {
 	if _, last := lastComment(b, comments); last != nil {
 		// test that it begins with the correct prefix

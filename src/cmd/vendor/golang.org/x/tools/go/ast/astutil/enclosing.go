@@ -11,8 +11,6 @@ import (
 	"go/ast"
 	"go/token"
 	"sort"
-
-	"golang.org/x/tools/internal/typeparams"
 )
 
 // PathEnclosingInterval returns the node that encloses the source
@@ -54,11 +52,11 @@ import (
 // interior whitespace of the assignment.  E is considered interior
 // whitespace of the BlockStmt containing the assignment.
 //
-// Precondition: [start, end) both lie within the same file as root.
-// TODO(adonovan): return (nil, false) in this case and remove precond.
-// Requires FileSet; see loader.tokenFileContainsPos.
-//
-// Postcondition: path is never nil; it always contains at least 'root'.
+// The resulting path is never empty; it always contains at least the
+// 'root' *ast.File.  Ideally PathEnclosingInterval would reject
+// intervals that lie wholly or partially outside the range of the
+// file, but unfortunately ast.File records only the token.Pos of
+// the 'package' keyword, but not of the start of the file itself.
 func PathEnclosingInterval(root *ast.File, start, end token.Pos) (path []ast.Node, exact bool) {
 	// fmt.Printf("EnclosingInterval %d %d\n", start, end) // debugging
 
@@ -134,6 +132,7 @@ func PathEnclosingInterval(root *ast.File, start, end token.Pos) (path []ast.Nod
 		return false // inexact: overlaps multiple children
 	}
 
+	// Ensure [start,end) is nondecreasing.
 	if start > end {
 		start, end = end, start
 	}
@@ -321,7 +320,7 @@ func childrenOf(n ast.Node) []ast.Node {
 			children = append(children, n.Recv)
 		}
 		children = append(children, n.Name)
-		if tparams := typeparams.ForFuncType(n.Type); tparams != nil {
+		if tparams := n.Type.TypeParams; tparams != nil {
 			children = append(children, tparams)
 		}
 		if n.Type.Params != nil {
@@ -376,7 +375,7 @@ func childrenOf(n ast.Node) []ast.Node {
 			tok(n.Lbrack, len("[")),
 			tok(n.Rbrack, len("]")))
 
-	case *typeparams.IndexListExpr:
+	case *ast.IndexListExpr:
 		children = append(children,
 			tok(n.Lbrack, len("[")),
 			tok(n.Rbrack, len("]")))
@@ -587,7 +586,7 @@ func NodeDescription(n ast.Node) string {
 		return "decrement statement"
 	case *ast.IndexExpr:
 		return "index expression"
-	case *typeparams.IndexListExpr:
+	case *ast.IndexListExpr:
 		return "index list expression"
 	case *ast.InterfaceType:
 		return "interface type"

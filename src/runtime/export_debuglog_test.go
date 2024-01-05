@@ -25,22 +25,22 @@ func (l *dlogger) S(x string) *dlogger   { return l.s(x) }
 func (l *dlogger) PC(x uintptr) *dlogger { return l.pc(x) }
 
 func DumpDebugLog() string {
-	g := getg()
-	g.writebuf = make([]byte, 0, 1<<20)
+	gp := getg()
+	gp.writebuf = make([]byte, 0, 1<<20)
 	printDebugLog()
-	buf := g.writebuf
-	g.writebuf = nil
+	buf := gp.writebuf
+	gp.writebuf = nil
 
 	return string(buf)
 }
 
 func ResetDebugLog() {
-	stopTheWorld("ResetDebugLog")
+	stw := stopTheWorld(stwForTestResetDebugLog)
 	for l := allDloggers; l != nil; l = l.allLink {
 		l.w.write = 0
 		l.w.tick, l.w.nano = 0, 0
 		l.w.r.begin, l.w.r.end = 0, 0
 		l.w.r.tick, l.w.r.nano = 0, 0
 	}
-	startTheWorld()
+	startTheWorld(stw)
 }

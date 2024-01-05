@@ -38,9 +38,14 @@ type FuncDebug struct {
 	// Register-resident output parameters for the function. This is filled in at
 	// SSA generation time.
 	RegOutputParams []*ir.Name
+	// Variable declarations that were removed during optimization
+	OptDcl []*ir.Name
 
 	// Filled in by the user. Translates Block and Value ID to PC.
-	GetPC func(ID, ID) int64
+	//
+	// NOTE: block is only used if value is BlockStart.ID or BlockEnd.ID.
+	// Otherwise, it is ignored.
+	GetPC func(block, value ID) int64
 }
 
 type BlockDebug struct {
@@ -68,8 +73,8 @@ func (ls *liveSlot) String() string {
 	return fmt.Sprintf("0x%x.%d.%d", ls.Registers, ls.stackOffsetValue(), int32(ls.StackOffset)&1)
 }
 
-func (loc liveSlot) absent() bool {
-	return loc.Registers == 0 && !loc.onStack()
+func (ls liveSlot) absent() bool {
+	return ls.Registers == 0 && !ls.onStack()
 }
 
 // StackOffset encodes whether a value is on the stack and if so, where.
@@ -431,7 +436,7 @@ func (sc *slotCanonicalizer) canonSlot(idx SlKeyIdx) LocalSlot {
 // synthesizes new (dead) values for the non-live params or the
 // non-live pieces of partially live params.
 func PopulateABIInRegArgOps(f *Func) {
-	pri := f.ABISelf.ABIAnalyzeFuncType(f.Type.FuncType())
+	pri := f.ABISelf.ABIAnalyzeFuncType(f.Type)
 
 	// When manufacturing new slots that correspond to splits of
 	// composite parameters, we want to avoid creating a new sub-slot
@@ -517,7 +522,7 @@ func PopulateABIInRegArgOps(f *Func) {
 		if !isNamedRegParam(inp) {
 			continue
 		}
-		n := inp.Name.(*ir.Name)
+		n := inp.Name
 
 		// Param is spread across one or more registers. Walk through
 		// each piece to see whether we've seen an arg reg op for it.
@@ -613,7 +618,7 @@ func BuildFuncDebug(ctxt *obj.Link, f *Func, loggingLevel int, stackOffset func(
 	// This would probably be better as an output from stackframe.
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
-			if v.Op == OpVarDef || v.Op == OpVarKill {
+			if v.Op == OpVarDef {
 				n := v.Aux.(*ir.Name)
 				if ir.IsSynthetic(n) {
 					continue
@@ -801,7 +806,7 @@ func (state *debugState) liveness() []*BlockDebug {
 // the first call, subsequent calls can only shrink startState.
 //
 // Passing forLocationLists=true enables additional side-effects that
-// are necessary for building location lists but superflous while still
+// are necessary for building location lists but superfluous while still
 // iterating to an answer.
 //
 // If previousBlock is non-nil, it registers changes vs. that block's
@@ -967,7 +972,7 @@ func (state *debugState) mergePredecessors(b *Block, blockLocs []*BlockDebug, pr
 	}
 
 	state.currentState.reset(abt.T{})
-	// The normal logic of "reset" is incuded in the intersection loop below.
+	// The normal logic of "reset" is included in the intersection loop below.
 
 	slotLocs := state.currentState.slots
 
@@ -1080,7 +1085,7 @@ func (state *debugState) processValue(v *Value, vSlots []SlotID, vReg *Register)
 	}
 
 	switch {
-	case v.Op == OpVarDef, v.Op == OpVarKill:
+	case v.Op == OpVarDef:
 		n := v.Aux.(*ir.Name)
 		if ir.IsSynthetic(n) {
 			break
@@ -1366,7 +1371,7 @@ func (state *debugState) buildLocationLists(blockLocs []*BlockDebug) {
 
 	// Flush any leftover entries live at the end of the last block.
 	for varID := range state.lists {
-		state.writePendingEntry(VarID(varID), state.f.Blocks[len(state.f.Blocks)-1].ID, FuncEnd.ID)
+		state.writePendingEntry(VarID(varID), -1, FuncEnd.ID)
 		list := state.lists[varID]
 		if state.loggingLevel > 0 {
 			if len(list) == 0 {
@@ -1732,7 +1737,7 @@ func isNamedRegParam(p abi.ABIParamAssignment) bool {
 	if p.Name == nil {
 		return false
 	}
-	n := p.Name.(*ir.Name)
+	n := p.Name
 	if n.Sym() == nil || n.Sym().IsBlank() {
 		return false
 	}
@@ -1749,10 +1754,10 @@ func isNamedRegParam(p abi.ABIParamAssignment) bool {
 // it constructs a 2-element location list: the first element holds
 // the input register, and the second element holds the stack location
 // of the param (the assumption being that when optimization is off,
-// each input param reg will be spilled in the prolog.
+// each input param reg will be spilled in the prolog).
 func BuildFuncDebugNoOptimized(ctxt *obj.Link, f *Func, loggingEnabled bool, stackOffset func(LocalSlot) int32, rval *FuncDebug) {
 
-	pri := f.ABISelf.ABIAnalyzeFuncType(f.Type.FuncType())
+	pri := f.ABISelf.ABIAnalyzeFuncType(f.Type)
 
 	// Look to see if we have any named register-promoted parameters.
 	// If there are none, bail early and let the caller sort things
@@ -1788,7 +1793,7 @@ func BuildFuncDebugNoOptimized(ctxt *obj.Link, f *Func, loggingEnabled bool, sta
 			continue
 		}
 
-		n := inp.Name.(*ir.Name)
+		n := inp.Name
 		sl := LocalSlot{N: n, Type: inp.Type, Off: 0}
 		rval.Vars = append(rval.Vars, n)
 		rval.Slots = append(rval.Slots, sl)

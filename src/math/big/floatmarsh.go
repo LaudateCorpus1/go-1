@@ -8,14 +8,15 @@ package big
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
 
 // Gob codec version. Permits backward-compatible changes to the encoding.
 const floatGobVersion byte = 1
 
-// GobEncode implements the gob.GobEncoder interface.
-// The Float value and all its attributes (precision,
+// GobEncode implements the [encoding/gob.GobEncoder] interface.
+// The [Float] value and all its attributes (precision,
 // rounding mode, accuracy) are marshaled.
 func (x *Float) GobEncode() ([]byte, error) {
 	if x == nil {
@@ -57,7 +58,7 @@ func (x *Float) GobEncode() ([]byte, error) {
 	return buf, nil
 }
 
-// GobDecode implements the gob.GobDecoder interface.
+// GobDecode implements the [encoding/gob.GobDecoder] interface.
 // The result is rounded per the precision and rounding mode of
 // z unless z's precision is 0, in which case z is set exactly
 // to the decoded value.
@@ -66,6 +67,9 @@ func (z *Float) GobDecode(buf []byte) error {
 		// Other side sent a nil or default value.
 		*z = Float{}
 		return nil
+	}
+	if len(buf) < 6 {
+		return errors.New("Float.GobDecode: buffer too small")
 	}
 
 	if buf[0] != floatGobVersion {
@@ -83,6 +87,9 @@ func (z *Float) GobDecode(buf []byte) error {
 	z.prec = binary.BigEndian.Uint32(buf[2:])
 
 	if z.form == finite {
+		if len(buf) < 10 {
+			return errors.New("Float.GobDecode: buffer too small for finite form float")
+		}
 		z.exp = int32(binary.BigEndian.Uint32(buf[6:]))
 		z.mant = z.mant.setBytes(buf[10:])
 	}
@@ -92,11 +99,15 @@ func (z *Float) GobDecode(buf []byte) error {
 		z.SetPrec(uint(oldPrec))
 	}
 
+	if msg := z.validate0(); msg != "" {
+		return errors.New("Float.GobDecode: " + msg)
+	}
+
 	return nil
 }
 
-// MarshalText implements the encoding.TextMarshaler interface.
-// Only the Float value is marshaled (in full precision), other
+// MarshalText implements the [encoding.TextMarshaler] interface.
+// Only the [Float] value is marshaled (in full precision), other
 // attributes such as precision or accuracy are ignored.
 func (x *Float) MarshalText() (text []byte, err error) {
 	if x == nil {
@@ -106,7 +117,7 @@ func (x *Float) MarshalText() (text []byte, err error) {
 	return x.Append(buf, 'g', -1), nil
 }
 
-// UnmarshalText implements the encoding.TextUnmarshaler interface.
+// UnmarshalText implements the [encoding.TextUnmarshaler] interface.
 // The result is rounded per the precision and rounding mode of z.
 // If z's precision is 0, it is changed to 64 before rounding takes
 // effect.

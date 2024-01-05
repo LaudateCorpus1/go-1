@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"go/token"
 	"sort"
+	"strings"
 )
 
 type byPos []*CommentGroup
@@ -28,7 +29,7 @@ func sortComments(list []*CommentGroup) {
 }
 
 // A CommentMap maps an AST node to a list of comment groups
-// associated with it. See NewCommentMap for a description of
+// associated with it. See [NewCommentMap] for a description of
 // the association.
 type CommentMap map[Node][]*CommentGroup
 
@@ -311,7 +312,7 @@ func (cmap CommentMap) String() string {
 	}
 	sort.Sort(byInterval(nodes))
 
-	var buf bytes.Buffer
+	var buf strings.Builder
 	fmt.Fprintln(&buf, "CommentMap {")
 	for _, node := range nodes {
 		comment := cmap[node]
